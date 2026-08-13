@@ -103,17 +103,19 @@ struct TermRow {
 }
 
 impl TermRow {
-    fn from_record(record: &TermRecord) -> Self {
+    /// Consuming on purpose: the encoding string moves into the row rather than
+    /// being cloned per write.
+    fn from_record(record: TermRecord) -> Self {
         Self {
-            id: record_id(record.addr()),
-            codec: record.codec().to_owned(),
-            term_json: record.term_json().to_owned(),
-            signature: record.signature().to_owned(),
-            source_arity: record.source_arity(),
-            target_arity: record.target_arity(),
-            depth: record.depth(),
-            generator_count: record.generator_count(),
-            nf_class: record.nf_class().to_owned(),
+            id: record_id(&record.addr),
+            codec: record.codec,
+            term_json: record.term_json,
+            signature: record.signature,
+            source_arity: record.source_arity,
+            target_arity: record.target_arity,
+            depth: record.depth,
+            generator_count: record.generator_count,
+            nf_class: record.nf_class,
         }
     }
 
@@ -276,11 +278,20 @@ where
     pub async fn put(&self, term: &ColoredExpr<G>) -> Result<TermAddr> {
         let record = term::encode(term)?;
         let addr = record.addr().clone();
-        self.client()
-            .query(PUT)
-            .bind(("row", TermRow::from_record(&record)))
-            .await?
-            .check()?;
+        // The table-existence guard lives on the shared executor — see
+        // `Store::run_write`. No unique index and no classified READONLY list
+        // on this tier: a readonly refusal here would mean two distinct
+        // encodings produced one content address, which deserves to surface as
+        // the raw database error it is.
+        self.store
+            .run_write(
+                TERM_TABLE,
+                PUT,
+                ("row", TermRow::from_record(record)),
+                None,
+                &[],
+            )
+            .await?;
         Ok(addr)
     }
 
@@ -305,12 +316,10 @@ where
         }
 
         let addrs: Vec<TermAddr> = records.iter().map(|r| r.addr().clone()).collect();
-        let rows: Vec<TermRow> = records.iter().map(TermRow::from_record).collect();
-        self.client()
-            .query(PUT_MANY)
-            .bind(("rows", rows))
-            .await?
-            .check()?;
+        let rows: Vec<TermRow> = records.into_iter().map(TermRow::from_record).collect();
+        self.store
+            .run_write(TERM_TABLE, PUT_MANY, ("rows", rows), None, &[])
+            .await?;
         Ok(addrs)
     }
 
@@ -337,12 +346,10 @@ where
         // query error from the other. `SELECT` raises where `record::exists`
         // absorbs, and the raise has no structured discriminator, so this is a
         // message match; the integration suite pins it against the engine.
-        let row: Option<TermRow> = match response.take(0) {
-            Ok(row) => row,
-            Err(e) if error::is_missing_table(&e, TERM_TABLE) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let Some(row) = row else {
+        let Some(row) =
+            error::take_absorbing_missing_table::<Option<TermRow>>(response.take(0), TERM_TABLE)?
+                .flatten()
+        else {
             return Ok(None);
         };
         let record = row.into_record()?;

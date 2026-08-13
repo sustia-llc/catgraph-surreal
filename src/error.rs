@@ -311,6 +311,26 @@ pub(crate) fn is_missing_table(e: &surrealdb::Error, table: &str) -> bool {
         .contains(&format!("The table '{table}' does not exist"))
 }
 
+/// The sentinel the write guard throws when its table has vanished.
+///
+/// Every write runs inside a transaction that checks the table is still
+/// *defined* before touching it — because a write against an undefined table
+/// does not fail: the engine silently auto-creates it `TYPE ANY SCHEMALESS`,
+/// permanently disarming every database-side guard while every documented
+/// signal stays green. Reads absorb a vanished table as "absent"; a write must
+/// be **loud** instead, because it is about to re-create the table wrong.
+pub(crate) fn undefined_table_sentinel(table: &str) -> String {
+    format!("catgraph-surreal: the `{table}` table is not defined; re-open the store")
+}
+
+/// Whether an error is the write guard's own sentinel for `table`.
+///
+/// Matches text this crate itself threw, so unlike the other classifiers it is
+/// not at the mercy of upstream rewording.
+pub(crate) fn is_undefined_table_guard(e: &surrealdb::Error, table: &str) -> bool {
+    e.message().contains(&undefined_table_sentinel(table))
+}
+
 /// Whether an error is a unique index on `table` refusing a write.
 ///
 /// Also message-keyed, and also pinned by an integration test that provokes a
@@ -324,9 +344,13 @@ pub(crate) fn is_duplicate(e: &surrealdb::Error, index: &str) -> bool {
 /// Whether an error is a `READONLY` column refusing a changed value, and if so
 /// which column.
 ///
-/// Message-keyed for the same reason as its neighbours, and matched against the
-/// caller's own column list so an unfamiliar field name is *not* claimed as one
-/// of ours. Pinned by an integration test that provokes a real refusal.
+/// Message-keyed for the same reason as its neighbours — and **anchored to the
+/// engine's whole rendering** (`` Found changed value for field `f` ``), not to
+/// the bare `` field `f` `` fragment. The distinction is load-bearing: other
+/// refusals echo caller-supplied values verbatim (a unique-index message quotes
+/// the colliding key), so an unanchored fragment can be *steered into matching*
+/// by hostile or unlucky key strings. Pinned by an integration test that
+/// provokes a real refusal.
 pub(crate) fn read_only_field(e: &surrealdb::Error, fields: &[&str]) -> Option<String> {
     let message = e.message();
     if !message.contains("but field is readonly") {
@@ -334,8 +358,57 @@ pub(crate) fn read_only_field(e: &surrealdb::Error, fields: &[&str]) -> Option<S
     }
     fields
         .iter()
-        .find(|field| message.contains(&format!("field `{field}`")))
+        .find(|field| message.contains(&format!("Found changed value for field `{field}`")))
         .map(|field| (*field).to_owned())
+}
+
+/// Translate a refused write into a typed error, in the one safe order.
+///
+/// **Duplicate is tested first, deliberately.** The unique-index refusal echoes
+/// the colliding *value* — caller-supplied strings included — so a genome or
+/// key containing readonly-shaped text could otherwise steer a genuine
+/// collision into `ReadOnly`, whose documented remedy ("supply a new key")
+/// would file the data under a fabricated identity while a foreign row keeps
+/// the real one. The readonly rendering echoes no values, so this order cannot
+/// misroute in the other direction.
+pub(crate) fn classify_write(
+    e: &surrealdb::Error,
+    table: &str,
+    unique_index: Option<&str>,
+    readonly_fields: &[&str],
+) -> Option<StoreError> {
+    if let Some(index) = unique_index
+        && is_duplicate(e, index)
+    {
+        return Some(StoreError::Duplicate {
+            table: table.to_owned(),
+            index: index.to_owned(),
+        });
+    }
+    if let Some(field) = read_only_field(e, readonly_fields) {
+        return Some(StoreError::ReadOnly {
+            table: table.to_owned(),
+            field,
+        });
+    }
+    None
+}
+
+/// Absorb "the table does not exist" into `None` on a **read** path.
+///
+/// Reads treat a vanished table as absence — an absent table really does
+/// contain no rows, and the schema guard is the loud detector for the
+/// condition. Write paths must never use this: they go through the write guard
+/// instead, which makes the same condition loud.
+pub(crate) fn take_absorbing_missing_table<T>(
+    result: std::result::Result<T, surrealdb::Error>,
+    table: &str,
+) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(e) if is_missing_table(&e, table) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// The store's result alias.

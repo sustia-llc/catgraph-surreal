@@ -412,6 +412,38 @@ async fn a_disarmed_readonly_clause_is_detected_as_drift() {
     assert!(detail.contains("term_json"), "{detail}");
 }
 
+/// A table that vanishes after open must make a WRITE loud, not quiet: a bare
+/// write against an undefined table does not fail — the engine auto-creates it
+/// `TYPE ANY SCHEMALESS`, permanently disarming every database-side guard while
+/// every documented signal stays green. The write guard turns that into
+/// [`StoreError::Schema`], and the table stays undefined.
+#[tokio::test]
+async fn a_write_after_the_table_vanishes_is_refused_loudly() {
+    let (store, terms) = bootstrapped("write_after_drop").await;
+    store
+        .client()
+        .query("REMOVE TABLE term")
+        .await
+        .expect("the removal runs")
+        .check()
+        .expect("the removal succeeds");
+
+    let err = terms
+        .put(&copy_then_add())
+        .await
+        .expect_err("a write must not silently re-create the table");
+    assert!(matches!(err, StoreError::Schema { .. }), "{err:?}");
+
+    // And the guard aborted before the write could auto-create anything.
+    let mut response = store
+        .client()
+        .query("RETURN (INFO FOR DB).tables.term")
+        .await
+        .expect("reading the table definition");
+    let definition: Option<String> = response.take(0).expect("the definition slot");
+    assert_eq!(definition, None, "the table must remain undefined");
+}
+
 /// A table that vanishes after open answers "absent", identically from both
 /// read methods — the same condition must not read as `false` from one and as
 /// an opaque query error from the other.

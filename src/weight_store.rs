@@ -97,15 +97,17 @@ struct WeightRow {
 }
 
 impl WeightRow {
-    fn from_record(record: &WeightRecord) -> Self {
+    /// Consuming on purpose: the coordinate buffer moves into the row rather
+    /// than being memcpy'd a second time per write.
+    fn from_record(record: WeightRecord) -> Self {
         Self {
-            id: RecordId::new(WEIGHT_TABLE, record.key()),
-            codec: record.codec().to_owned(),
-            genome: record.genome().to_owned(),
-            gen_key: record.gen_key().to_owned(),
-            dim: record.dim(),
-            coordinates: Bytes::from(record.coordinates().to_vec()),
-            finite: record.finite(),
+            id: RecordId::new(WEIGHT_TABLE, record.key.as_str()),
+            codec: record.codec,
+            genome: record.genome,
+            gen_key: record.gen_key,
+            dim: record.dim,
+            coordinates: Bytes::from(record.coordinates),
+            finite: record.finite,
         }
     }
 
@@ -208,16 +210,17 @@ impl WeightStore {
     /// - a database error otherwise.
     pub async fn put(&self, genome: &str, gen_key: &str, weights: &RModule<f64>) -> Result<()> {
         let record = weight::encode(genome, gen_key, weights)?;
-        let outcome = self
-            .client()
-            .query(PUT)
-            .bind(("row", WeightRow::from_record(&record)))
+        // The guard, and the duplicate-before-readonly classification order,
+        // live on the shared executor — see `Store::run_write`.
+        self.store
+            .run_write(
+                WEIGHT_TABLE,
+                PUT,
+                ("row", WeightRow::from_record(record)),
+                Some(WEIGHT_KEY_INDEX),
+                &WEIGHT_FIELDS,
+            )
             .await
-            .and_then(|response| response.check());
-        match outcome {
-            Ok(_) => Ok(()),
-            Err(e) => Err(classify(&e).unwrap_or_else(|| e.into())),
-        }
     }
 
     /// Load a weight vector, revalidating it.
@@ -246,10 +249,10 @@ impl WeightStore {
             .bind(("genome", genome.to_owned()))
             .bind(("gen_key", gen_key.to_owned()))
             .await?;
-        let rows: Vec<WeightRow> = match response.take(0) {
-            Ok(rows) => rows,
-            Err(e) if error::is_missing_table(&e, WEIGHT_TABLE) => return Ok(None),
-            Err(e) => return Err(e.into()),
+        let Some(rows) =
+            error::take_absorbing_missing_table::<Vec<WeightRow>>(response.take(0), WEIGHT_TABLE)?
+        else {
+            return Ok(None);
         };
         let Some(row) = rows.into_iter().next() else {
             return Ok(None);
@@ -273,35 +276,13 @@ impl WeightStore {
             .bind(("genome", genome.to_owned()))
             .bind(("gen_key", gen_key.to_owned()))
             .await?;
-        let ids: Vec<RecordId> = match response.take(0) {
-            Ok(ids) => ids,
-            Err(e) if error::is_missing_table(&e, WEIGHT_TABLE) => return Ok(false),
-            Err(e) => return Err(e.into()),
+        let Some(ids) =
+            error::take_absorbing_missing_table::<Vec<RecordId>>(response.take(0), WEIGHT_TABLE)?
+        else {
+            return Ok(false);
         };
         Ok(!ids.is_empty())
     }
-}
-
-/// Translate the two write refusals this tier expects into typed errors.
-///
-/// Neither refusal carries a structured discriminator — both are message-keyed,
-/// scoped to this table's own index and column names, and pinned by integration
-/// tests that provoke real refusals. Anything else is left as the database's own
-/// error rather than guessed at.
-fn classify(e: &surrealdb::Error) -> Option<StoreError> {
-    if let Some(field) = error::read_only_field(e, &WEIGHT_FIELDS) {
-        return Some(StoreError::ReadOnly {
-            table: WEIGHT_TABLE.to_owned(),
-            field,
-        });
-    }
-    if error::is_duplicate(e, WEIGHT_KEY_INDEX) {
-        return Some(StoreError::Duplicate {
-            table: WEIGHT_TABLE.to_owned(),
-            index: WEIGHT_KEY_INDEX.to_owned(),
-        });
-    }
-    None
 }
 
 #[cfg(test)]

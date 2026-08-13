@@ -2,9 +2,10 @@
 
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
+use surrealdb::types::SurrealValue;
 
 use crate::capability::{self, Requirements};
-use crate::error::Result;
+use crate::error::{self, Result, StoreError};
 
 /// Configure and open a [`Store`].
 ///
@@ -133,5 +134,92 @@ impl Store {
     #[must_use]
     pub fn session(&self) -> Surreal<Any> {
         self.client.clone()
+    }
+
+    /// Run a repository write, guarded and classified.
+    ///
+    /// Every repository write goes through here, and the shared shape is the
+    /// point — the invariants below hold for a tier *by construction* rather
+    /// than by each repository re-copying them:
+    ///
+    /// - **The table-existence guard.** The statement runs inside a transaction
+    ///   that first checks the table is still *defined* and `THROW`s a
+    ///   crate-owned sentinel otherwise. A bare write against an undefined
+    ///   table would not fail — the engine auto-creates the table
+    ///   `TYPE ANY SCHEMALESS`, silently disarming every schema-level guard —
+    ///   so where the read paths absorb a vanished table as absence, a write
+    ///   surfaces it as [`StoreError::Schema`]: re-open the store.
+    /// - **Refusal classification in the one safe order** — see
+    ///   [`error::classify_write`]: unique-index collisions are recognised
+    ///   before `READONLY` refusals, because the collision message echoes
+    ///   caller-supplied values that can imitate the readonly rendering.
+    ///
+    /// The composed query text embeds only crate-owned constants (the table
+    /// name and the statement); values ride as bound parameters.
+    pub(crate) async fn run_write<V: SurrealValue + 'static>(
+        &self,
+        table: &'static str,
+        statement: &str,
+        binding: (&'static str, V),
+        unique_index: Option<&'static str>,
+        readonly_fields: &'static [&'static str],
+    ) -> Result<()> {
+        let guarded = format!(
+            "BEGIN; \
+             IF (INFO FOR DB).tables.{table} == NONE {{ THROW \"{sentinel}\" }}; \
+             {statement}; \
+             COMMIT;",
+            sentinel = error::undefined_table_sentinel(table),
+        );
+        let mut response = self.client.query(guarded).bind(binding).await?;
+        // `check()` would surface the FIRST error slot — which, inside the
+        // guard transaction, is the guard statement's "not executed due to a
+        // failed transaction" boilerplate whenever the *write* is what failed.
+        // The classifiable message lives on the failing statement's own slot,
+        // so every slot is inspected, in slot order.
+        let mut errors: Vec<(usize, surrealdb::Error)> =
+            response.take_errors().into_iter().collect();
+        if errors.is_empty() {
+            return Ok(());
+        }
+        errors.sort_by_key(|(slot, _)| *slot);
+
+        for (_, e) in &errors {
+            if error::is_undefined_table_guard(e, table) {
+                return Err(StoreError::Schema {
+                    table: table.to_owned(),
+                    detail: "the table is no longer defined — it was removed after this store \
+                             opened; writing would silently re-create it schemaless, so re-open \
+                             (bootstrap and verify) instead"
+                        .to_owned(),
+                });
+            }
+        }
+        for (_, e) in &errors {
+            if let Some(classified) = error::classify_write(e, table, unique_index, readonly_fields)
+            {
+                return Err(classified);
+            }
+        }
+        // Nothing classified: prefer the slot carrying a real message over the
+        // rolled-back boilerplate, falling back to the first slot.
+        let (_, first) = errors.remove(0);
+        let informative = errors.into_iter().map(|(_, e)| e).find(|e| {
+            !matches!(
+                e.query_details(),
+                Some(surrealdb::types::QueryError::NotExecuted)
+            )
+        });
+        match informative {
+            Some(e)
+                if matches!(
+                    first.query_details(),
+                    Some(surrealdb::types::QueryError::NotExecuted)
+                ) =>
+            {
+                Err(e.into())
+            }
+            _ => Err(first.into()),
+        }
     }
 }

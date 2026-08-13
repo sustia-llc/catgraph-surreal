@@ -122,18 +122,20 @@ struct CospanRow {
 }
 
 impl CospanRow {
-    fn from_record(record: &CospanRecord) -> Self {
+    /// Consuming on purpose: the payload vectors move into the row rather than
+    /// being deep-cloned per write.
+    fn from_record(record: CospanRecord) -> Self {
         Self {
-            id: record_id(record.addr()),
-            codec: record.codec().to_owned(),
-            dom_leg: record.dom_leg().to_vec(),
-            cod_leg: record.cod_leg().to_vec(),
-            apex: record.apex().to_vec(),
-            dom_len: record.dom_len(),
-            cod_len: record.cod_len(),
-            apex_len: record.apex_len(),
-            scalar_count: record.scalar_count(),
-            canon_key: record.canon_key().to_owned(),
+            id: record_id(&record.addr),
+            codec: record.codec,
+            dom_leg: record.dom_leg,
+            cod_leg: record.cod_leg,
+            apex: record.apex,
+            dom_len: record.dom_len,
+            cod_len: record.cod_len,
+            apex_len: record.apex_len,
+            scalar_count: record.scalar_count,
+            canon_key: record.canon_key,
         }
     }
 
@@ -175,14 +177,6 @@ fn address_of(id: &RecordId) -> Result<CospanAddr> {
         context: COSPAN_TABLE.to_owned(),
         detail: format!("record id key `{key}` is not a cospan address"),
     })
-}
-
-/// The error a refused unique-key write becomes.
-fn duplicate() -> StoreError {
-    StoreError::Duplicate {
-        table: COSPAN_TABLE.to_owned(),
-        index: COSPAN_CANON_INDEX.to_owned(),
-    }
 }
 
 /// Stores and loads cospans, addressed by the digest of their presentation.
@@ -298,7 +292,7 @@ impl<L: LabelCodec> CospanStore<L> {
     pub async fn put(&self, cospan: &Cospan<L>) -> Result<CospanAddr> {
         let record = cospan::encode(cospan)?;
         let addr = record.addr().clone();
-        self.write(PUT, ("row", CospanRow::from_record(&record)))
+        self.write(PUT, ("row", CospanRow::from_record(record)))
             .await?;
         Ok(addr)
     }
@@ -325,32 +319,32 @@ impl<L: LabelCodec> CospanStore<L> {
         }
 
         let addrs: Vec<CospanAddr> = records.iter().map(|r| r.addr().clone()).collect();
-        let rows: Vec<CospanRow> = records.iter().map(CospanRow::from_record).collect();
+        let rows: Vec<CospanRow> = records.into_iter().map(CospanRow::from_record).collect();
         self.write(PUT_MANY, ("rows", rows)).await?;
         Ok(addrs)
     }
 
-    /// Run a write, translating a refused unique key into a typed error.
+    /// Run a write through the shared guarded executor.
     ///
-    /// The refusal carries no structured discriminator — only a message naming
-    /// the index — so the translation is message-keyed, scoped to this index by
-    /// name, and pinned by an integration test that provokes a real collision.
+    /// The guard and the refusal classification live on [`Store::run_write`],
+    /// so this tier holds the write invariants by construction. No `READONLY`
+    /// column list is passed: on this tier a readonly refusal would mean two
+    /// distinct presentations produced one content address, which deserves to
+    /// surface as the raw database error it is.
     async fn write<V: SurrealValue + 'static>(
         &self,
         statement: &str,
         binding: (&'static str, V),
     ) -> Result<()> {
-        let outcome = self
-            .client()
-            .query(statement)
-            .bind(binding)
+        self.store
+            .run_write(
+                COSPAN_TABLE,
+                statement,
+                binding,
+                Some(COSPAN_CANON_INDEX),
+                &[],
+            )
             .await
-            .and_then(|response| response.check());
-        match outcome {
-            Ok(_) => Ok(()),
-            Err(e) if error::is_duplicate(&e, COSPAN_CANON_INDEX) => Err(duplicate()),
-            Err(e) => Err(e.into()),
-        }
     }
 
     /// Load a cospan, revalidating it.
@@ -373,12 +367,11 @@ impl<L: LabelCodec> CospanStore<L> {
         // A vanished table answers `None`, matching `contains` — the same
         // condition must not read as `false` from one method and as an opaque
         // query error from the other.
-        let row: Option<CospanRow> = match response.take(0) {
-            Ok(row) => row,
-            Err(e) if error::is_missing_table(&e, COSPAN_TABLE) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        let Some(row) = row else {
+        let Some(row) = error::take_absorbing_missing_table::<Option<CospanRow>>(
+            response.take(0),
+            COSPAN_TABLE,
+        )?
+        .flatten() else {
             return Ok(None);
         };
         row.into_record()?.revalidate().map(Some)
@@ -391,12 +384,23 @@ impl<L: LabelCodec> CospanStore<L> {
     /// key decides equality of morphisms outright, so the answer is exact rather
     /// than a candidate set.
     ///
+    /// **The matched row is loaded and revalidated before its address is
+    /// returned.** The index lookup alone would trust the stored `canon_key`
+    /// column — the one read that skips revalidation — and a tampered key
+    /// (written raw, or replayed under `OPTION IMPORT`) would hand back the
+    /// address of an unrelated cospan as a confident wrong yes. Revalidation
+    /// re-derives the key from the row's own presentation, so a squatting row
+    /// surfaces as [`StoreError::Corrupt`] here rather than as a silent
+    /// misdirection. Costs one row read; correctness of "is this morphism
+    /// stored?" is what this method exists for.
+    ///
     /// A vanished table answers `None`, consistently with the other reads.
     ///
     /// # Errors
     ///
-    /// [`StoreError::Corrupt`] if a leg points outside the apex, or if a stored
-    /// record id is not an address; a database error if the read is rejected.
+    /// [`StoreError::Corrupt`] if the matched row fails revalidation (including
+    /// a tampered canonical key), or if a stored record id is not an address; a
+    /// database error if the read is rejected.
     pub async fn find_by_canon(&self, cospan: &Cospan<L>) -> Result<Option<CospanAddr>> {
         let key = cospan::canon_key(cospan)?;
         let mut response = self
@@ -404,12 +408,21 @@ impl<L: LabelCodec> CospanStore<L> {
             .query(FIND_BY_CANON.as_str())
             .bind(("canon_key", key))
             .await?;
-        let ids: Vec<RecordId> = match response.take(0) {
-            Ok(ids) => ids,
-            Err(e) if error::is_missing_table(&e, COSPAN_TABLE) => return Ok(None),
-            Err(e) => return Err(e.into()),
+        let Some(ids) =
+            error::take_absorbing_missing_table::<Vec<RecordId>>(response.take(0), COSPAN_TABLE)?
+        else {
+            return Ok(None);
         };
-        ids.first().map(address_of).transpose()
+        let Some(id) = ids.first() else {
+            return Ok(None);
+        };
+        let addr = address_of(id)?;
+        // Revalidate the matched row; a row that vanished between the two reads
+        // is answered as absent, like every other read.
+        match self.get(&addr).await? {
+            Some(_) => Ok(Some(addr)),
+            None => Ok(None),
+        }
     }
 }
 

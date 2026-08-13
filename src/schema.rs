@@ -387,8 +387,15 @@ pub const WEIGHT_FIELDS: [&str; 7] = [
 /// [`COSPAN_CANON_INDEX`].
 pub const WEIGHT_KEY_INDEX: &str = "weight_key";
 
+/// The non-unique index on the `finite` flag.
+///
+/// The flag exists so "which checkpoints went non-finite?" is a query rather
+/// than a scan of the store's largest table — which requires the index, not
+/// just the column.
+pub const WEIGHT_FINITE_INDEX: &str = "weight_finite";
+
 /// Every index the [`WEIGHT_TABLE`] schema declares.
-pub const WEIGHT_INDEXES: [&str; 1] = [WEIGHT_KEY_INDEX];
+pub const WEIGHT_INDEXES: [&str; 2] = [WEIGHT_KEY_INDEX, WEIGHT_FINITE_INDEX];
 
 /// The weight table's own definition, as the engine renders it.
 pub const WEIGHT_TABLE_DEFINITION: &str =
@@ -427,10 +434,16 @@ pub const WEIGHT_FIELD_DEFINITIONS: [(&str, &str); 7] = [
 ];
 
 /// Every declared index's definition, as the engine renders it.
-pub const WEIGHT_INDEX_DEFINITIONS: [(&str, &str); 1] = [(
-    WEIGHT_KEY_INDEX,
-    "DEFINE INDEX weight_key ON weight FIELDS genome, gen_key UNIQUE",
-)];
+pub const WEIGHT_INDEX_DEFINITIONS: [(&str, &str); 2] = [
+    (
+        WEIGHT_KEY_INDEX,
+        "DEFINE INDEX weight_key ON weight FIELDS genome, gen_key UNIQUE",
+    ),
+    (
+        WEIGHT_FINITE_INDEX,
+        "DEFINE INDEX weight_finite ON weight FIELDS finite",
+    ),
+];
 
 /// The weight table's DDL.
 const WEIGHT_DDL: &str = "\
@@ -446,6 +459,7 @@ DEFINE FIELD IF NOT EXISTS coordinates ON weight TYPE bytes READONLY;
 DEFINE FIELD IF NOT EXISTS finite ON weight TYPE bool READONLY;
 
 DEFINE INDEX IF NOT EXISTS weight_key ON weight FIELDS genome, gen_key UNIQUE;
+DEFINE INDEX IF NOT EXISTS weight_finite ON weight FIELDS finite;
 ";
 
 /// The weight table's schema, as this build declares it.

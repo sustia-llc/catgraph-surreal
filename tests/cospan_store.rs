@@ -444,6 +444,33 @@ async fn a_vanished_table_reads_as_absent_from_every_read_method() {
     );
 }
 
+/// A table that vanishes after open must make a WRITE loud, not quiet: a bare
+/// write against an undefined table auto-creates it `TYPE ANY SCHEMALESS`,
+/// silently disarming the unique canonical key — after which two presentations
+/// of one morphism store side by side with no [`StoreError::Duplicate`] ever
+/// raised. The write guard turns the condition into [`StoreError::Schema`],
+/// and the table stays undefined.
+#[tokio::test]
+async fn a_write_after_the_table_vanishes_is_refused_loudly() {
+    let (store, cospans) = bootstrapped("cospan_write_after_drop").await;
+    cospans.put(&merge()).await.expect("the first write lands");
+    run(&store, "REMOVE TABLE cospan").await;
+
+    let err = cospans
+        .put(&id2())
+        .await
+        .expect_err("a write must not silently re-create the table");
+    assert!(matches!(err, StoreError::Schema { .. }), "{err:?}");
+
+    let mut response = store
+        .client()
+        .query("RETURN (INFO FOR DB).tables.cospan")
+        .await
+        .expect("reading the table definition");
+    let definition: Option<String> = response.take(0).expect("the definition slot");
+    assert_eq!(definition, None, "the table must remain undefined");
+}
+
 // ------------------------------------------------------- corrupt documents
 
 /// A cospan row, written by hand.
@@ -534,6 +561,57 @@ async fn a_row_whose_leg_points_outside_the_apex_is_rejected() {
     row.dom_leg = vec![0, 5];
     row.dom_len = 2;
     expect_corrupt(load_raw("cospan_corrupt_bounds", refile(row)).await);
+}
+
+/// A decodable-but-non-canonical label spelling is corrupt, not accepted:
+/// `usize::decode` happily parses `"007"`, and a forged row spelled that way —
+/// filed under its own (different) address but carrying the *canonical*
+/// spelling's `canon_key` — would otherwise squat the honest morphism's unique
+/// key while the two-identity discipline reads all green.
+#[tokio::test]
+async fn a_non_canonical_label_spelling_is_rejected_on_load() {
+    let mut row = good_row();
+    row.apex = vec!["007".to_owned()];
+    row.canon_key = cospan::canon_key(&merge()).expect("the canonical key");
+    let result = load_raw("cospan_squat_load", refile(row)).await;
+    match result {
+        Err(StoreError::Corrupt { detail, .. }) => {
+            assert!(detail.contains("non-canonical"), "{detail}");
+        }
+        other => panic!("expected a non-canonical-spelling rejection, got {other:?}"),
+    }
+}
+
+/// And the lookup path the squat would actually poison: `find_by_canon` must
+/// revalidate the matched row rather than trust the stored `canon_key` — a
+/// tampered key must surface as an error, never as a confident wrong address.
+#[tokio::test]
+async fn find_by_canon_rejects_a_row_squatting_a_key_it_does_not_derive() {
+    let (store, cospans) = bootstrapped("cospan_squat_find").await;
+
+    // A forged row: the braid's presentation, filed honestly under its own
+    // address, but carrying the IDENTITY's canonical key.
+    let braid_record = cospan::encode(&braid()).expect("the braid encodes");
+    let mut row = RawRow {
+        id: RecordId::new(schema::COSPAN_TABLE, braid_record.addr().as_str()),
+        codec: braid_record.codec().to_owned(),
+        dom_leg: braid_record.dom_leg().to_vec(),
+        cod_leg: braid_record.cod_leg().to_vec(),
+        apex: braid_record.apex().to_vec(),
+        dom_len: braid_record.dom_len(),
+        cod_len: braid_record.cod_len(),
+        apex_len: braid_record.apex_len(),
+        scalar_count: braid_record.scalar_count(),
+        canon_key: cospan::canon_key(&id2()).expect("the identity's key"),
+    };
+    row = refile(row);
+    write_raw(&store, &row).await;
+
+    let err = cospans
+        .find_by_canon(&id2())
+        .await
+        .expect_err("a squatting row must not be served as a confident yes");
+    assert!(matches!(err, StoreError::Corrupt { .. }), "{err:?}");
 }
 
 /// A negative leg entry cannot come from an in-memory cospan, but the column is

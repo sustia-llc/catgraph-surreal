@@ -89,13 +89,16 @@ pub fn record_key(genome: &str, gen_key: &str) -> Result<String> {
 /// conversion happens once, in [`encode`], where it is checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeightRecord {
-    key: String,
-    codec: String,
-    genome: String,
-    gen_key: String,
-    dim: i64,
-    coordinates: Vec<u8>,
-    finite: bool,
+    // Crate-visible so the row conversion can MOVE the coordinate buffer rather
+    // than memcpy it a second time per write; the public surface stays the
+    // getters.
+    pub(crate) key: String,
+    pub(crate) codec: String,
+    pub(crate) genome: String,
+    pub(crate) gen_key: String,
+    pub(crate) dim: i64,
+    pub(crate) coordinates: Vec<u8>,
+    pub(crate) finite: bool,
 }
 
 impl WeightRecord {

@@ -76,34 +76,39 @@ pub const COSPAN_CODEC: &str = "cgc1";
 /// leg that land on it, and those of the codomain leg.
 type Class = (String, Vec<usize>, Vec<usize>);
 
-/// The equivalence data `CospanCanon` holds, recomputed from the public
-/// accessors: `(domain size, codomain size, sorted apex signatures)`.
+/// The equivalence data `CospanCanon` holds, recomputed over already-encoded
+/// labels: `(domain size, codomain size, sorted apex signatures)`.
 ///
-/// Mirrors `Cospan::canonical_form` step for step, with labels put through
-/// [`LabelCodec::encode`] so the result is serializable. Sorting is what makes
-/// the value invariant under any relabelling of apex vertices.
+/// Mirrors `Cospan::canonical_form` step for step. Sorting is what makes the
+/// value invariant under any relabelling of apex vertices.
+///
+/// Taking *encoded* labels rather than a `Cospan<L>` is deliberate: the write
+/// path encodes the apex exactly once and reuses the strings here, and the
+/// load path reuses the **stored** strings — which it may, because revalidation
+/// has already required each one to be the canonical spelling of the label it
+/// decodes to.
 ///
 /// # Errors
 ///
 /// [`StoreError::Corrupt`] if any leg index is out of bounds for the apex — the
 /// invariant `Cospan::new` only checks under `debug_assert!`.
-fn canonical_classes<L: LabelCodec>(cospan: &Cospan<L>) -> Result<(usize, usize, Vec<Class>)> {
-    let left = cospan.left_to_middle();
-    let right = cospan.right_to_middle();
-    let middle = cospan.middle();
-
-    let mut classes: Vec<Class> = middle
+fn canonical_classes(
+    dom_leg: &[usize],
+    cod_leg: &[usize],
+    apex: &[String],
+) -> Result<(usize, usize, Vec<Class>)> {
+    let mut classes: Vec<Class> = apex
         .iter()
-        .map(|label| (label.encode(), Vec::new(), Vec::new()))
+        .map(|encoded| (encoded.clone(), Vec::new(), Vec::new()))
         .collect();
 
     // Boundary indices are pushed in ascending order, so each preimage vector is
     // sorted already.
-    for (side, leg) in [(Side::Domain, left), (Side::Codomain, right)] {
-        for (boundary, &apex) in leg.iter().enumerate() {
+    for (side, leg) in [(Side::Domain, dom_leg), (Side::Codomain, cod_leg)] {
+        for (boundary, &apex_index) in leg.iter().enumerate() {
             let class = classes
-                .get_mut(apex)
-                .ok_or_else(|| out_of_bounds(side, boundary, apex, middle.len()))?;
+                .get_mut(apex_index)
+                .ok_or_else(|| out_of_bounds(side, boundary, apex_index, apex.len()))?;
             match side {
                 Side::Domain => class.1.push(boundary),
                 Side::Codomain => class.2.push(boundary),
@@ -112,7 +117,12 @@ fn canonical_classes<L: LabelCodec>(cospan: &Cospan<L>) -> Result<(usize, usize,
     }
 
     classes.sort();
-    Ok((left.len(), right.len(), classes))
+    Ok((dom_leg.len(), cod_leg.len(), classes))
+}
+
+/// Encode a cospan's apex once, in order.
+fn encoded_apex<L: LabelCodec>(cospan: &Cospan<L>) -> Vec<String> {
+    cospan.middle().iter().map(LabelCodec::encode).collect()
 }
 
 /// Which leg a bounds failure was found on.
@@ -153,7 +163,9 @@ fn out_of_bounds(side: Side, boundary: usize, apex: usize, apex_len: usize) -> S
 /// [`StoreError::Corrupt`] if a leg index is out of bounds for the apex;
 /// [`StoreError::Codec`] if the encoding fails.
 pub fn canon_key<L: LabelCodec>(cospan: &Cospan<L>) -> Result<String> {
-    let (dom_len, cod_len, classes) = canonical_classes(cospan)?;
+    let apex = encoded_apex(cospan);
+    let (dom_len, cod_len, classes) =
+        canonical_classes(cospan.left_to_middle(), cospan.right_to_middle(), &apex)?;
     Ok(canon_key_of(dom_len, cod_len, &classes)?.0)
 }
 
@@ -181,16 +193,18 @@ fn canon_key_of(dom_len: usize, cod_len: usize, classes: &[Class]) -> Result<(St
 /// checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CospanRecord {
-    addr: CospanAddr,
-    codec: String,
-    dom_leg: Vec<i64>,
-    cod_leg: Vec<i64>,
-    apex: Vec<String>,
-    dom_len: i64,
-    cod_len: i64,
-    apex_len: i64,
-    scalar_count: i64,
-    canon_key: String,
+    // Crate-visible so the row conversion can MOVE the payload vectors rather
+    // than deep-clone them per write; the public surface stays the getters.
+    pub(crate) addr: CospanAddr,
+    pub(crate) codec: String,
+    pub(crate) dom_leg: Vec<i64>,
+    pub(crate) cod_leg: Vec<i64>,
+    pub(crate) apex: Vec<String>,
+    pub(crate) dom_len: i64,
+    pub(crate) cod_len: i64,
+    pub(crate) apex_len: i64,
+    pub(crate) scalar_count: i64,
+    pub(crate) canon_key: String,
 }
 
 impl CospanRecord {
@@ -301,13 +315,20 @@ impl CospanRecord {
     ///    apex. This is the check `Cospan::new` only makes under
     ///    `debug_assert!`, and skipping it would mean a release build panics
     ///    later instead of erroring here.
-    /// 4. **Labels.** Each apex label is decoded; an unrecognised encoding is a
-    ///    corrupt document, not a missing value.
+    /// 4. **Labels.** Each apex label is decoded — and then **re-encoded and
+    ///    compared against the stored string**. Decoding alone is not enough:
+    ///    `decode` may accept non-canonical spellings (`usize::decode` accepts
+    ///    `"007"`), and a decodable-but-non-canonical apex would let a forged
+    ///    presentation squat the *canonical* spelling's `canon_key` under a
+    ///    different address, breaking the two-identity discipline outright.
+    ///    Requiring `encode(decode(s)) == s` pins every stored label to its one
+    ///    canonical spelling — and it is what entitles step 5 to reuse the
+    ///    stored strings instead of re-encoding.
     /// 5. **Derived columns.** The sizes, the scalar count, and the canonical
-    ///    key are all re-derived from the reconstructed cospan and compared. A
-    ///    hand-edited `canon_key` in particular must be caught: it is `UNIQUE`
-    ///    and complete, so a corrupted one would make a key lookup claim two
-    ///    unequal morphisms are equal.
+    ///    key are all re-derived from the validated presentation and compared.
+    ///    A hand-edited `canon_key` in particular must be caught: it is
+    ///    `UNIQUE` and complete, so a corrupted one would make a key lookup
+    ///    claim two unequal morphisms are equal.
     ///
     /// # Errors
     ///
@@ -339,16 +360,26 @@ impl CospanRecord {
             .iter()
             .enumerate()
             .map(|(index, encoded)| {
-                L::decode(encoded).ok_or_else(|| {
+                let label = L::decode(encoded).ok_or_else(|| {
                     corrupt(&format!(
                         "apex vertex {index} carries `{encoded}`, which is not a label of this type"
                     ))
-                })
+                })?;
+                let canonical = label.encode();
+                if &canonical != encoded {
+                    return Err(corrupt(&format!(
+                        "apex vertex {index} carries `{encoded}`, a non-canonical spelling of \
+                         `{canonical}`"
+                    )));
+                }
+                Ok(label)
             })
             .collect::<Result<Vec<L>>>()?;
 
+        // The stored strings are reusable here precisely because step 4 pinned
+        // each one as the canonical spelling of its label.
+        let derived = derive(&left, &right, &self.apex)?;
         let cospan = Cospan::new(left, right, middle);
-        let derived = derive(&cospan)?;
 
         expect_column("dom_len", self.dom_len, derived.dom_len)?;
         expect_column("cod_len", self.cod_len, derived.cod_len)?;
@@ -374,9 +405,9 @@ struct Derived {
     canon_key: String,
 }
 
-/// Compute the derived columns from a cospan.
-fn derive<L: LabelCodec>(cospan: &Cospan<L>) -> Result<Derived> {
-    let (dom_len, cod_len, classes) = canonical_classes(cospan)?;
+/// Compute the derived columns from a presentation's encoded pieces.
+fn derive(dom_leg: &[usize], cod_leg: &[usize], apex: &[String]) -> Result<Derived> {
+    let (dom_len, cod_len, classes) = canonical_classes(dom_leg, cod_leg, apex)?;
     let (canon_key, scalar_count) = canon_key_of(dom_len, cod_len, &classes)?;
     Ok(Derived {
         dom_len: to_column("dom_len", dom_len)?,
@@ -405,9 +436,10 @@ pub fn encode<L: LabelCodec>(cospan: &Cospan<L>) -> Result<CospanRecord> {
     let apex_len = cospan.middle().len();
     let dom_leg = from_leg(Side::Domain, cospan.left_to_middle(), apex_len)?;
     let cod_leg = from_leg(Side::Codomain, cospan.right_to_middle(), apex_len)?;
-    let apex: Vec<String> = cospan.middle().iter().map(LabelCodec::encode).collect();
+    // Encoded exactly once; `derive` reuses these strings.
+    let apex = encoded_apex(cospan);
 
-    let derived = derive(cospan)?;
+    let derived = derive(cospan.left_to_middle(), cospan.right_to_middle(), &apex)?;
 
     Ok(CospanRecord {
         addr: address_of(&dom_leg, &cod_leg, &apex)?,
@@ -751,6 +783,22 @@ mod tests {
         match columns.build().revalidate::<usize>() {
             Err(StoreError::TypeMismatch { field, .. }) => assert_eq!(field, "codec"),
             other => panic!("expected a codec type mismatch, got {other:?}"),
+        }
+    }
+
+    /// A spelling that decodes but does not re-encode to itself is corrupt:
+    /// accepting it would let a forged presentation squat the canonical
+    /// spelling's `canon_key` under a different address.
+    #[test]
+    fn a_non_canonical_label_spelling_is_corrupt() {
+        let record = encode(&Cospan::new(vec![0], vec![0], vec![7usize])).expect("encodes");
+        let mut columns = Columns::of(&record);
+        columns.apex = vec!["007".to_owned()];
+        match columns.refile().build().revalidate::<usize>() {
+            Err(StoreError::Corrupt { detail, .. }) => {
+                assert!(detail.contains("non-canonical"), "{detail}");
+            }
+            other => panic!("expected a non-canonical-spelling rejection, got {other:?}"),
         }
     }
 

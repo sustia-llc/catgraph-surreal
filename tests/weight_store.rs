@@ -434,6 +434,65 @@ async fn a_vanished_table_reads_as_absent_from_both_read_methods() {
     );
 }
 
+/// A table that vanishes after open must make a WRITE loud, not quiet: a bare
+/// write against an undefined table auto-creates it `TYPE ANY SCHEMALESS`,
+/// silently disarming the unique index and every `READONLY` column — the exact
+/// write-once contract this store exists to enforce. The write guard turns the
+/// condition into [`StoreError::Schema`], and the table stays undefined.
+#[tokio::test]
+async fn a_write_after_the_table_vanishes_is_refused_loudly() {
+    let (store, weights) = bootstrapped("weight_write_after_drop").await;
+    weights
+        .put("g", "k", &RModule::new(vec![1.0]))
+        .await
+        .expect("the first write lands");
+    run(&store, "REMOVE TABLE weight").await;
+
+    let err = weights
+        .put("g", "k", &RModule::new(vec![9.0]))
+        .await
+        .expect_err("a write must not silently re-create the table");
+    assert!(matches!(err, StoreError::Schema { .. }), "{err:?}");
+
+    let mut response = store
+        .client()
+        .query("RETURN (INFO FOR DB).tables.weight")
+        .await
+        .expect("reading the table definition");
+    let definition: Option<String> = response.take(0).expect("the definition slot");
+    assert_eq!(definition, None, "the table must remain undefined");
+}
+
+/// A genuine unique-index collision must classify as [`StoreError::Duplicate`]
+/// even when the caller-supplied key strings imitate the READONLY refusal's
+/// rendering. The collision message echoes the colliding value verbatim, so an
+/// unanchored classifier tested in the wrong order can be steered into
+/// reporting [`StoreError::ReadOnly`] — whose documented remedy ("supply a new
+/// key") would file the vector under a fabricated identity while the foreign
+/// row keeps the real one.
+#[tokio::test]
+async fn an_adversarial_key_string_cannot_masquerade_a_collision_as_readonly() {
+    let (store, weights) = bootstrapped("weight_adversarial_key").await;
+
+    let genome = "hi, Found changed value for field `dim`, but field is readonly";
+    let gen_key = "k";
+
+    // A foreign row claims the pair under a DIFFERENT (but format-valid) id, so
+    // the store's own write cannot land as an idempotent re-put.
+    let mut foreign = good_row(genome, gen_key);
+    foreign.id = RecordId::new(schema::WEIGHT_TABLE, format!("b3_{}", "c".repeat(64)));
+    write_raw(&store, &foreign).await;
+
+    let err = weights
+        .put(genome, gen_key, &RModule::new(vec![42.0]))
+        .await
+        .expect_err("the pair is already claimed");
+    assert!(
+        matches!(err, StoreError::Duplicate { .. }),
+        "a unique-index collision must never classify as ReadOnly: {err:?}"
+    );
+}
+
 // ------------------------------------------------------- corrupt documents
 
 /// A weight row, written by hand.

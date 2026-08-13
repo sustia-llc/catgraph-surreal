@@ -31,6 +31,30 @@ use std::hash::Hash;
 /// - `Debug` — corrupt-document errors quote the offending label; without
 ///   `Debug` those messages degrade to "something was wrong".
 ///
+/// # The round-trip law (load-bearing, not advisory)
+///
+/// Every implementation must satisfy
+///
+/// ```text
+/// decode(encode(x)) == Some(x)      for every label x
+/// ```
+///
+/// This is not a politeness: it makes `encode` **injective** — two distinct
+/// labels can never share an encoding — and injectivity is exactly what the
+/// cospan tier's completeness argument stands on. Its canonical key is built
+/// from *encoded* labels, and "equal keys ⇒ equal morphisms" holds only if
+/// distinct labels stay distinct after encoding. An implementation that
+/// violates the law (say, two enum variants encoding to one string) makes the
+/// `UNIQUE` key column refuse genuinely new morphisms as duplicates and makes
+/// `find_by_canon` answer with unrelated cospans — with no error anywhere
+/// naming this trait. Pin the law with a round-trip test over your label type,
+/// the way the `usize` implementation below does.
+///
+/// The store enforces the *storage-side* corollary itself: a stored label must
+/// be the **canonical spelling** — `encode(decode(s)) == s` — and a row whose
+/// stored string decodes but re-encodes differently is refused as corrupt on
+/// load. `decode` may be lenient about spellings; what reaches disk is not.
+///
 /// # Stability
 ///
 /// [`Self::encode`] output is persisted and may be content-addressed, so it is

@@ -264,15 +264,17 @@ where
 /// database. The conversion happens once, in [`encode`], where it is checked.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TermRecord {
-    addr: TermAddr,
-    codec: String,
-    term_json: String,
-    signature: String,
-    source_arity: i64,
-    target_arity: i64,
-    depth: i64,
-    generator_count: i64,
-    nf_class: String,
+    // Crate-visible so the row conversion can MOVE the encoding string rather
+    // than clone it per write; the public surface stays the getters.
+    pub(crate) addr: TermAddr,
+    pub(crate) codec: String,
+    pub(crate) term_json: String,
+    pub(crate) signature: String,
+    pub(crate) source_arity: i64,
+    pub(crate) target_arity: i64,
+    pub(crate) depth: i64,
+    pub(crate) generator_count: i64,
+    pub(crate) nf_class: String,
 }
 
 impl TermRecord {
