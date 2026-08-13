@@ -5,12 +5,13 @@
 //!
 //! # Status
 //!
-//! Early scaffold. What is here today is the substrate the repositories will be
-//! built on: the [error type](error) and its retry classifiers, the
-//! [label codec](codec) bridging catgraph's generic labels to their stored form,
-//! the [term address](addr) newtype, and a [capability-checked](capability)
-//! [`Store`] handle. The repositories themselves, the schema, and the
-//! notification bus land next.
+//! Early. The substrate is in place — the [error type](error) and its retry
+//! classifiers, the [label codec](codec) bridging catgraph's generic labels to
+//! their stored form, the [term address](addr) newtype, and a
+//! [capability-checked](capability) [`Store`] handle — and the first repository
+//! with it: the [term schema](schema), the [term codec and revalidation
+//! discipline](term), and the [term store](term_store). The cospan, weight,
+//! lineage, and document tiers and the notification bus land next.
 //!
 //! ```no_run
 //! use catgraph_surreal::StoreBuilder;
@@ -77,10 +78,15 @@ pub mod addr;
 pub mod capability;
 pub mod codec;
 pub mod error;
+pub mod schema;
 pub mod store;
+pub mod term;
+pub mod term_store;
 
 pub use addr::TermAddr;
 pub use capability::{Capability, EndpointCapabilities, Requirements};
 pub use codec::LabelCodec;
 pub use error::{Result, RevalidationStage, StoreError};
 pub use store::{Store, StoreBuilder};
+pub use term::TermRecord;
+pub use term_store::TermStore;

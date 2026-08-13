@@ -4,10 +4,12 @@ SurrealDB persistence for [catgraph](https://github.com/sustia-llc/catgraph)'s
 category-theoretic structures — terms, cospans, and parameter weights — embedded
 or over a server connection.
 
-> **Status: early scaffold.** What is here is the substrate the repositories will
-> be built on: the error type and its retry classifiers, the label codec, the
-> term-address newtype, and a capability-checked connection handle. The
-> repositories, the schema, and the notification bus land next.
+> **Status: early.** The substrate is in place — the error type and its retry
+> classifiers, the label codec, the term-address newtype, and a
+> capability-checked connection handle — and the first repository with it: the
+> content-addressed term store, its schema, and the revalidation discipline that
+> guards every load. The cospan, weight, lineage, and document tiers and the
+> notification bus land next.
 
 ## Why this crate exists
 
@@ -49,6 +51,51 @@ async fn open() -> Result<()> {
     Ok(())
 }
 ```
+
+## Terms
+
+`TermStore` keeps catgraph terms addressed by the digest of their canonical
+encoding: a term's record id *is* its content address, which makes storing one
+idempotent and makes two writers racing on the same term write the same bytes.
+
+Three decisions are worth knowing before using it.
+
+**A term is stored as one opaque JSON string, not as a native nested object.**
+Expanding it would break twice: the SDK writes `usize` through an unchecked
+`as i64` cast, and catgraph deliberately produces `usize::MAX` saturation
+sentinels — one of those becomes `-1` with nothing raised anywhere — and content
+addressing needs the stored bytes to be the bytes that were hashed. The columns
+beside it (`signature`, arities, `depth`, generator count, `nf_class`) are all
+derived from that string, and every one is re-derived and compared on load.
+
+**Loading always revalidates. There is no trusting path.** `ColoredExpr`'s
+`Deserialize` does not re-run the type check; database-side guards are void
+under `OPTION IMPORT` and are never evaluated at all on a default embedded
+connection. So every load runs four checks in a fixed order — JSON parse, depth,
+arity well-formedness, then a re-run of the type check against the stored
+signature — and the order is load-bearing: skipping the arity screen makes the
+next step abort rather than return an error.
+
+**The generator type's `Serialize` must be deterministic.** No `HashMap` or
+`HashSet` in a generator's serde representation: their iteration order is
+unspecified, so two runs would encode one term two ways, producing two addresses
+and two rows for one term. Debug builds round-trip every encoding and assert the
+bytes reproduce, which catches this at the first write.
+
+Two limits follow from the encoding. `PropExpr` serializes externally tagged, so
+each nesting level costs two JSON containers against `serde_json`'s 128-container
+parser limit — roughly **64 levels**, well under catgraph's own structural limit
+of 256. That is a safety property and a round-trip cap, so encoding parses its
+own output back before returning: what this store writes, it can read.
+
+Term identity has two columns with different strengths. The record id is
+*representation-level* — distinct syntax is distinct identity, which is what a
+population store wants. `nf_class` is a **sound semantic bucket**: equal values
+mean the terms are equal in the free symmetric monoidal category, while equal
+morphisms may still land in different buckets. It is indexed and deliberately
+*not* unique; duplicates within a bucket are expected. Complete semantic
+deduplication is an in-process concern over a working set, not something to
+persist.
 
 ## Engines
 

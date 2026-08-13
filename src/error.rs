@@ -156,6 +156,21 @@ pub enum StoreError {
         detail: String,
     },
 
+    /// The live schema is not the one this version of the store declares.
+    ///
+    /// Raised by the bootstrap's own drift guard. It is not a document problem
+    /// and not retryable: something outside the store changed the schema, or a
+    /// database written by a different version of the store was opened by this
+    /// one. Reading on regardless is how a newer document silently loses a
+    /// column.
+    #[error("schema drift on `{table}`: {detail}")]
+    Schema {
+        /// The table whose schema disagreed.
+        table: String,
+        /// How it disagreed.
+        detail: String,
+    },
+
     /// A stored value had a different shape than the schema promised.
     #[error("type mismatch for `{field}`: expected {expected}, found {actual}")]
     TypeMismatch {
@@ -331,6 +346,10 @@ mod tests {
                 field: "coordinates".to_owned(),
                 expected: "bytes".to_owned(),
                 actual: "array".to_owned(),
+            },
+            StoreError::Schema {
+                table: "term".to_owned(),
+                detail: "column set has drifted: missing [depth], unexpected []".to_owned(),
             },
             StoreError::BusGap {
                 expected: 42,

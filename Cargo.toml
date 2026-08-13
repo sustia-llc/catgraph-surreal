@@ -44,15 +44,29 @@ surrealdb = { version = "3.2.4", default-features = false }
 # catgraph over the git tag via HTTPS, never a path dependency: an external
 # consumer's CI has to be able to fetch this crate and its dependencies.
 #
-# `catgraph-applied` (with `serde` — the term tier round-trips
-# `ColoredExpr`/`PropExpr`) and `catgraph-dl` (without `serde` — weights persist
-# as raw IEEE-754 bytes through the public `dim()`/`as_slice()`/`new()`
-# surface) enter with the repositories that use them; declaring them ahead of
-# any use would make every consumer fetch and compile them for nothing.
+# `catgraph-dl` (without `serde` — weights persist as raw IEEE-754 bytes through
+# the public `dim()`/`as_slice()`/`new()` surface) enters with the weight store;
+# declaring it ahead of any use would make every consumer fetch and compile it
+# for nothing.
 catgraph = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.11.0" }
 
+# The term tier's payload type. `serde` is required — it is what puts
+# `ColoredExpr`/`PropExpr` on the wire at all. `default-features = false` drops
+# the `parallel` feature, whose rayon edge buys this crate nothing: the store
+# does arity walks and hashing, not the linear-combination and Temperley-Lieb
+# work those call sites accelerate, and the same dependency would have to build
+# on every target this crate checks, wasm included.
+catgraph-applied = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.11.0", default-features = false, features = [
+    "serde",
+] }
+
 thiserror = "2"
+serde = "1"
 serde_json = "1"
+
+# Content addressing. A term's identity is the digest of its canonical encoding,
+# so this is on the write path of every stored term.
+blake3 = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

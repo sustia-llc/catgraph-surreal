@@ -549,10 +549,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "catgraph-applied"
+version = "0.11.0"
+source = "git+https://github.com/sustia-llc/catgraph?tag=v0.11.0#b94a390fb385c7ededb1c8eec6a1d4cf1fbaedc0"
+dependencies = [
+ "catgraph",
+ "either",
+ "itertools 0.15.0",
+ "num",
+ "permutations",
+ "rand_core 0.10.1",
+ "rust_decimal",
+ "serde",
+ "thiserror 2.0.20",
+ "union-find",
+]
+
+[[package]]
 name = "catgraph-surreal"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "catgraph",
+ "catgraph-applied",
+ "serde",
  "serde_json",
  "surrealdb",
  "thiserror 2.0.20",
@@ -2330,6 +2350,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "num"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35bd024e8b2ff75562e5f34e7f4905839deb4b22955ef5e73d2fea1b9813cb23"
+dependencies = [
+ "num-bigint",
+ "num-complex",
+ "num-integer",
+ "num-iter",
+ "num-rational",
+ "num-traits",
+]
+
+[[package]]
 name = "num-bigint"
 version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2385,6 +2419,17 @@ version = "0.1.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c92800bd69a1eac91786bcfe9da64a897eb72911b8dc3095decbd07429e8048b"
 dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
+name = "num-rational"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f83d14da390562dca69fc84082e73e548e1ad308d24accdedd2720017cb37824"
+dependencies = [
+ "num-bigint",
  "num-integer",
  "num-traits",
 ]
@@ -2930,6 +2975,12 @@ checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
 ]
+
+[[package]]
+name = "rand_core"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 
 [[package]]
 name = "rand_distr"
