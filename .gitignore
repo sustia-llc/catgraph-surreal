@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local editor / tooling state
+.idea/
+.vscode/
+*.swp
+
+# Scratch database files from local runs
+/data
+*.db

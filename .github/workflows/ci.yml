@@ -1,0 +1,59 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      # The committed lockfile must be canonical. Without this, CI silently
+      # re-resolves a stale lock in-runner and reports green on a dependency
+      # graph nobody committed — which matters more here than usual, since the
+      # catgraph dependencies are git-tag sources.
+      - run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Broken intra-doc links ship silently without a doc gate.
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+      # Default features (rocksdb).
+      - run: cargo test --workspace
+
+      # The `mem` engine is what the connect/probe smoke tests need; the default
+      # lane above compiles them out entirely, so without this run they never
+      # execute anywhere.
+      - run: cargo test --workspace --no-default-features --features mem
+      - run: cargo clippy --workspace --all-targets --no-default-features --features mem -- -D warnings
+
+      # Feature matrix. Each engine feature must build in isolation — feature
+      # unification inside a single `--all-features` run would hide a feature
+      # that only compiles because another one is also on.
+      - run: cargo check --no-default-features --features mem
+      - run: cargo check --no-default-features --features rocksdb
+      - run: cargo check --no-default-features --features kv
+      - run: cargo check --no-default-features --features server
+      # Every engine at once, to catch feature combinations that conflict.
+      - run: cargo check --no-default-features --features "mem rocksdb kv server"
+
+  # The `wasm` feature cannot build for a native target: the indxdb engine is
+  # built on browser APIs that are neither Send nor Sync, which cannot satisfy
+  # the transaction bounds SurrealDB's core requires natively. It gets its own
+  # target rather than being dropped from CI, since a feature that compiles
+  # nowhere is a feature that rots.
+  wasm-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      # `--lib` only: the dev-dependency graph (tokio's test macros) does not
+      # build for this target.
+      - run: cargo check --lib --no-default-features --features wasm --target wasm32-unknown-unknown

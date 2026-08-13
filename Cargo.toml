@@ -1,0 +1,61 @@
+[package]
+name = "catgraph-surreal"
+version = "0.1.0"
+edition = "2024"
+# Measured, not guessed: the cross-feature maximum over the resolved dependency
+# graph (see README "MSRV"). Re-measure whenever a dependency moves.
+rust-version = "1.94"
+license = "MIT"
+description = "SurrealDB persistence for catgraph's category-theoretic structures"
+repository = "https://github.com/sustia-llc/catgraph-surreal"
+readme = "README.md"
+keywords = ["surrealdb", "category-theory", "cospan", "persistence"]
+categories = ["database"]
+# The catgraph dependencies are git-tag sources, which crates.io forbids in a
+# published package. The crate is public-but-unpublished by design (it exists so
+# downstream CI can fetch it over HTTPS), so publishing is turned off rather than
+# left to fail at `cargo publish` time.
+publish = false
+
+[features]
+# RocksDB is the primary durable engine for this store.
+default = ["rocksdb"]
+# In-memory engine. Tests and correctness work only: conflict-retry tuning
+# measured here does NOT transfer to the persistent engines, which have a
+# different conflict surface.
+mem = ["surrealdb/kv-mem"]
+# Primary durable embedded engine.
+rocksdb = ["surrealdb/kv-rocksdb"]
+# SurrealKV. Every transaction commits with `Durability::Eventual` (commit is not
+# fsync), so this engine is gated on a durability soak before it carries data
+# whose loss would be silent.
+kv = ["surrealdb/kv-surrealkv"]
+# Server-tier client. BOTH transports on purpose: the capability split is real —
+# HTTP grants Backup but no live queries, WS grants live queries but no Backup.
+# A server-tier client that both checkpoints and subscribes needs both.
+server = ["surrealdb/protocol-ws", "surrealdb/protocol-http"]
+# Browser/edge engine.
+wasm = ["surrealdb/kv-indxdb"]
+
+[dependencies]
+# `default-features = false` is load-bearing: the SDK's defaults pull
+# protocol-ws + rustls into what would otherwise be a purely embedded build.
+surrealdb = { version = "3.2.4", default-features = false }
+
+# catgraph over the git tag via HTTPS, never a path dependency: an external
+# consumer's CI has to be able to fetch this crate and its dependencies.
+catgraph = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.11.0" }
+# `serde` is required — the term tier round-trips `ColoredExpr`/`PropExpr`.
+catgraph-applied = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.11.0", features = [
+    "serde",
+] }
+# NO `serde` feature: `RModule<f64>` weights persist as `bytes` (dim x 8
+# IEEE-754 LE), reached through the public `dim()`/`as_slice()`/`new()` surface.
+# dl's serde derives would only be needed for a generic scalar `S` or `Dual`.
+catgraph-dl = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.11.0" }
+
+thiserror = "2"
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
