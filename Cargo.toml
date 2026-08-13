@@ -50,6 +50,14 @@ surrealdb = { version = "3.2.4", default-features = false }
 # for nothing.
 catgraph = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.11.0" }
 
+# The weight tier's payload type, `RModule<f64>`. `serde` is deliberately NOT
+# enabled: coordinates are persisted as raw IEEE-754 bytes through the public
+# `dim()`/`as_slice()`/`new()` surface, which is bit-exact where a JSON encoding
+# is not — `serde_json` turns every non-finite into `null` on the way out and
+# then fails to read it back. The crate declares no `default` feature, so
+# `default-features = false` says what is meant rather than changing anything.
+catgraph-dl = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.11.0", default-features = false }
+
 # The term tier's payload type. `serde` is required — it is what puts
 # `ColoredExpr`/`PropExpr` on the wire at all. `default-features = false` drops
 # the `parallel` feature, whose rayon edge buys this crate nothing: the store
@@ -79,3 +87,13 @@ blake3 = "1"
 # terms, it does not interpret them), and a test asserts the two stay in
 # agreement so an upstream change fails CI instead of silently diverging.
 catgraph-syntax = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.11.0", default-features = false }
+# The canonical-key equivalence gate: `store_key(a) == store_key(b)` if and only
+# if `a.canonical_form() == b.canonical_form()`, over generated cospans. Both
+# directions matter, and neither is provable by a handful of examples.
+proptest = "1"
+# Dev-only, and for exactly one thing: `Cospan::new` bounds-checks under
+# `debug_assert!`, so an out-of-bounds leg cannot be built through it in a test
+# build. `add_boundary_node` checks nothing in any profile and takes an
+# `Either` — which is the only way to exhibit the value this store's own
+# bounds check exists to refuse.
+either = "1"

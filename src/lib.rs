@@ -7,11 +7,12 @@
 //!
 //! Early. The substrate is in place — the [error type](error) and its retry
 //! classifiers, the [label codec](codec) bridging catgraph's generic labels to
-//! their stored form, the [term address](addr) newtype, and a
-//! [capability-checked](capability) [`Store`] handle — and the first repository
-//! with it: the [term schema](schema), the [term codec and revalidation
-//! discipline](term), and the [term store](term_store). The cospan, weight,
-//! lineage, and document tiers and the notification bus land next.
+//! their stored form, the [content-address newtypes](addr), and a
+//! [capability-checked](capability) [`Store`] handle — and three repositories
+//! with it: the content-addressed [term store](term_store), the
+//! [cospan store](cospan_store) with its complete canonical key, and the
+//! [weight store](weight_store) on a bit-exact byte lane. The lineage and
+//! document tiers and the notification bus land next.
 //!
 //! ```no_run
 //! use catgraph_surreal::StoreBuilder;
@@ -82,16 +83,24 @@ mod readme_doctests {}
 pub mod addr;
 pub mod capability;
 pub mod codec;
+pub mod cospan;
+pub mod cospan_store;
 pub mod error;
 pub mod schema;
 pub mod store;
 pub mod term;
 pub mod term_store;
+pub mod weight;
+pub mod weight_store;
 
-pub use addr::TermAddr;
+pub use addr::{CospanAddr, TermAddr};
 pub use capability::{Capability, EndpointCapabilities, Requirements};
 pub use codec::LabelCodec;
+pub use cospan::CospanRecord;
+pub use cospan_store::CospanStore;
 pub use error::{Result, RevalidationStage, StoreError};
 pub use store::{Store, StoreBuilder};
 pub use term::TermRecord;
 pub use term_store::TermStore;
+pub use weight::WeightRecord;
+pub use weight_store::WeightStore;

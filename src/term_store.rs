@@ -43,7 +43,7 @@ use surrealdb::engine::any::Any;
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::addr::TermAddr;
-use crate::error::{Result, StoreError};
+use crate::error::{self, Result, StoreError};
 use crate::store::Store;
 use crate::term::{self, TermRecord};
 use crate::{schema, schema::TERM_TABLE};
@@ -150,16 +150,6 @@ impl TermRow {
 /// The record id a term address addresses.
 fn record_id(addr: &TermAddr) -> RecordId {
     RecordId::new(TERM_TABLE, addr.as_str())
-}
-
-/// Whether an error is the engine reporting that the term table is undefined.
-///
-/// Message-keyed by necessity (the raise carries no structured discriminator),
-/// scoped to this table's exact rendering, and pinned by an integration test —
-/// the same discipline as the shutdown classifier.
-fn is_missing_term_table(e: &surrealdb::Error) -> bool {
-    e.message()
-        .contains(&format!("The table '{TERM_TABLE}' does not exist"))
 }
 
 /// Stores and loads terms, addressed by the digest of their canonical encoding.
@@ -349,7 +339,7 @@ where
         // message match; the integration suite pins it against the engine.
         let row: Option<TermRow> = match response.take(0) {
             Ok(row) => row,
-            Err(e) if is_missing_term_table(&e) => return Ok(None),
+            Err(e) if error::is_missing_table(&e, TERM_TABLE) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
         let Some(row) = row else {

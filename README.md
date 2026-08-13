@@ -5,11 +5,12 @@ category-theoretic structures — terms, cospans, and parameter weights — embe
 or over a server connection.
 
 > **Status: early.** The substrate is in place — the error type and its retry
-> classifiers, the label codec, the term-address newtype, and a
-> capability-checked connection handle — and the first repository with it: the
-> content-addressed term store, its schema, and the revalidation discipline that
-> guards every load. The cospan, weight, lineage, and document tiers and the
-> notification bus land next.
+> classifiers, the label codec, the content-address newtypes, and a
+> capability-checked connection handle — and three repositories with it: the
+> content-addressed term store, the cospan store with its complete canonical
+> key, and the weight store on a bit-exact byte lane. Every one of them
+> revalidates what it loads. The lineage and document tiers and the notification
+> bus land next.
 
 ## Why this crate exists
 
@@ -106,6 +107,69 @@ morphisms may still land in different buckets. It is indexed and deliberately
 deduplication is an in-process concern over a working set, not something to
 persist.
 
+## Cospans
+
+`CospanStore` keeps two identities side by side, and the difference between them
+is the contract.
+
+**A cospan's record id is the content address of its *presentation*** — the two
+leg maps and the labelled apex, exactly as built. Legs are stored as ordered
+arrays rather than as graph edges, because a leg is an ordered function: as
+arrays the ordering is structural, while as edges every read would need an index
+column and an `ORDER BY`, and an edge lost anywhere in that pipeline would
+silently change which morphism the record describes rather than failing.
+
+**The `canon_key` column is the *morphism's* identity, and it is `UNIQUE`.** Two
+parallel cospans are equal as morphisms exactly when some bijection of their
+apexes commutes with both legs, and catgraph's `CospanCanon` decides that — so
+the key is a **complete** invariant, unlike the term tier's `nf_class`, which is
+only sound. The consequence is worth stating plainly: **writing a second,
+differently presented spelling of an already-stored morphism is refused**, with
+`StoreError::Duplicate`. The morphism is already there, at the address
+`find_by_canon` returns. Refusing keeps the surprise where a caller can see it;
+silently returning the stored presentation's address would mean `get(put(c))`
+handing back a cospan structurally unlike `c` with nothing said.
+
+The store computes that key itself. `CospanCanon` carries no serializable form —
+its equivalence data is private, and standard-library hash output is not stable
+across processes — but the data is fully recomputable from the public accessors,
+so the store re-derives it, encodes it deterministically, and hashes that. A
+proptest asserts the equivalence in **both** directions against
+`Cospan::canonical_form`: equal keys must mean equal morphisms, or the index
+would refuse a genuinely new one; equal morphisms must mean equal keys, or the
+store would hold duplicates it promised not to.
+
+One more guard exists because catgraph cannot provide it: `Cospan::new`
+bounds-checks legs against the apex under `debug_assert!` only, so a release
+build accepts an out-of-bounds leg and defers the failure to a panic somewhere
+else. This store bounds-checks on both sides — on write, so such a value never
+reaches disk, and on load, where it arrives as a tampered column.
+
+## Weights
+
+`WeightStore` keeps `RModule<f64>` coordinates as raw **little-endian IEEE-754
+bytes**, eight per coordinate, beside a `dim` column and a `finite` flag.
+
+Bytes rather than native floats, because of the export path. SurrealDB's value
+layer does round-trip non-finites bit-exactly through a store and a load — but a
+dump renders every `NaN`, whatever its sign or payload, as the bare literal
+`NaN`. So a checkpoint of a float column is lossy precisely where a training run
+most wants the evidence. Bytes export as `b"<HEX>"` and come back byte-identical,
+they sidestep the serde-JSON lane (which turns non-finites into `null` and then
+fails to read that back), and they are index-safe: float index keys go through a
+decimal encoding that collapses `±NaN` onto one key and `-0.0` onto `0.0`.
+
+A row is identified by `(genome, gen_key)`, two **opaque caller-supplied
+strings** carried by a unique index. The store derives no meaning from either
+half; key derivation and its stability guarantee stay with the caller.
+
+**Weights are write-once under their key.** Every column is `READONLY`:
+re-storing an identical vector is a no-op, and storing a different one is refused
+with `StoreError::ReadOnly`. A training loop that produces a new vector therefore
+supplies a new `gen_key`. Letting a key's value change underneath it would make
+every row referencing a `(genome, gen_key)` pair ambiguous about which vector it
+meant, which is the one property lineage and checkpoint data exist to have.
+
 ## Engines
 
 Every engine sits behind a cargo feature; `default` is `rocksdb`.
@@ -159,6 +223,11 @@ classifiers:
 | Conflict | `is_conflict()` | Retry in-process, bounded backoff with jitter |
 | Shutdown | `is_shutdown()` | Reconnect, then retry — **never persist as permanent** |
 | Everything else | neither | No blind retry |
+
+Two variants look retryable and are not, so they are worth naming: `Duplicate`
+(a unique index refusing a write — the equivalent record is already stored, and
+finding it is a read) and `ReadOnly` (a write-once column refusing a *changed*
+value). Both classify as neither conflict nor shutdown.
 
 Two subtleties are documented on the type itself, because getting either wrong
 loses data rather than merely erroring:

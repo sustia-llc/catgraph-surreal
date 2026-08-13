@@ -1,8 +1,22 @@
 //! Opaque handles to stored records.
+//!
+//! # One shape, several types
+//!
+//! Every content address and every store-derived key in this crate is the same
+//! string: a fixed alphabetic prefix followed by a full 256-bit BLAKE3 digest in
+//! lowercase hex. The shape is generated once, by a macro, so a second address
+//! type cannot drift from the first — and the types stay *distinct*, so a term
+//! address cannot be handed to a cospan read.
+//!
+//! The same shape is reused for derived key *columns* — a cospan's canonical
+//! key, a weight row's derived record key. That is deliberate: one prefix, one
+//! digest, one place to change when either moves. Those columns need no separate
+//! format validator, because every load re-derives them and compares, which
+//! decides the format along with everything else.
 
 use std::fmt;
 
-/// The prefix every term address carries.
+/// The prefix every address and derived key carries.
 ///
 /// Two properties depend on it, and both would break if it were dropped:
 ///
@@ -13,85 +27,131 @@ use std::fmt;
 /// - **The address self-describes its hash.** The digest algorithm is visible in
 ///   the address itself, so a future change of hash is a change of prefix rather
 ///   than a silent reinterpretation of existing addresses.
-const TERM_ADDR_PREFIX: &str = "b3_";
+const DIGEST_PREFIX: &str = "b3_";
 
-/// An opaque handle to a stored term.
+/// Whether `digest` is exactly 64 lowercase hex characters — a full 256-bit
+/// digest.
 ///
-/// The address is a content address: it is derived from the term's canonical
-/// encoding, so identical encodings share an address and different encodings
-/// never collide in practice.
-///
-/// # Opaque on purpose
-///
-/// The concrete encoding is an internal, versioned detail. There is no public
-/// field and no public constructor taking a pre-formatted string, so callers
-/// cannot come to depend on the layout — which leaves the store free to change
-/// digest or prefix later without breaking them. Callers that need the stored
-/// form use [`AsRef<str>`] or [`Display`](fmt::Display); callers holding a value
-/// read back out of the database use [`TermAddr::parse`], which validates.
-///
-/// Never build assumptions on the *rendered* form of a record id — escaping
-/// depends on the key's own characters. Interpolating an address into query text
-/// is always wrong; bind it as a parameter.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TermAddr(String);
-
-impl TermAddr {
-    /// Build an address from a hex digest.
-    ///
-    /// Returns `None` unless `digest` is exactly 64 lowercase hex characters —
-    /// a full 256-bit digest. Truncation is refused rather than accommodated:
-    /// a shortened digest weakens collision resistance, and a collision here
-    /// means two distinct terms silently becoming one stored record.
-    #[must_use]
-    pub fn from_digest(digest: &str) -> Option<Self> {
-        let is_full_length = digest.len() == 64;
-        let is_lower_hex = digest
+/// Truncation is refused rather than accommodated: a shortened digest weakens
+/// collision resistance, and a collision here means two distinct structures
+/// silently becoming one stored record.
+fn is_full_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
             .bytes()
-            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'));
-        if is_full_length && is_lower_hex {
-            Some(Self(format!("{TERM_ADDR_PREFIX}{digest}")))
-        } else {
-            None
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+}
+
+/// The prefixed BLAKE3 digest of `bytes`.
+///
+/// This is the derived-key form: the same shape as an address, but for a
+/// *column* rather than a record id. Used for keys the store computes and then
+/// re-computes on load to compare.
+pub(crate) fn digest_key(bytes: &[u8]) -> String {
+    format!("{DIGEST_PREFIX}{}", blake3::hash(bytes).to_hex())
+}
+
+/// Define a content-address newtype.
+///
+/// Every address type in this crate is generated here rather than written out,
+/// so their validation, prefix, and rendering cannot diverge from one another.
+macro_rules! content_address {
+    (
+        $(#[$meta:meta])*
+        $name:ident
+    ) => {
+        $(#[$meta])*
+        ///
+        /// # Opaque on purpose
+        ///
+        /// The concrete encoding is an internal, versioned detail. There is no
+        /// public field and no public constructor taking a pre-formatted
+        /// string, so callers cannot come to depend on the layout — which
+        /// leaves the store free to change digest or prefix later without
+        /// breaking them. Callers that need the stored form use [`AsRef<str>`]
+        /// or [`Display`](fmt::Display); callers holding a value read back out
+        /// of the database use `parse`, which validates.
+        ///
+        /// Never build assumptions on the *rendered* form of a record id —
+        /// escaping depends on the key's own characters. Interpolating an
+        /// address into query text is always wrong; bind it as a parameter.
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name(String);
+
+        impl $name {
+            /// Build an address from a hex digest.
+            ///
+            /// Returns `None` unless `digest` is exactly 64 lowercase hex
+            /// characters — a full 256-bit digest.
+            #[must_use]
+            pub fn from_digest(digest: &str) -> Option<Self> {
+                if is_full_digest(digest) {
+                    Some(Self(format!("{DIGEST_PREFIX}{digest}")))
+                } else {
+                    None
+                }
+            }
+
+            /// Recover an address from its stored form.
+            ///
+            /// Returns `None` for anything that is not a well-formed address,
+            /// so a corrupt or foreign record id is rejected at the boundary
+            /// rather than propagating inward as a plausible-looking handle.
+            #[must_use]
+            pub fn parse(raw: &str) -> Option<Self> {
+                let digest = raw.strip_prefix(DIGEST_PREFIX)?;
+                Self::from_digest(digest)
+            }
+
+            /// The stored form, as a string slice.
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            /// The digest portion, without the prefix.
+            #[must_use]
+            pub fn digest(&self) -> &str {
+                self.0.strip_prefix(DIGEST_PREFIX).expect(concat!(
+                    "invariant: every ",
+                    stringify!($name),
+                    " is constructed with the prefix and the field is private"
+                ))
+            }
         }
-    }
 
-    /// Recover an address from its stored form.
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                &self.0
+            }
+        }
+    };
+}
+
+content_address! {
+    /// An opaque handle to a stored term.
     ///
-    /// Returns `None` for anything that is not a well-formed address, so a
-    /// corrupt or foreign record id is rejected at the boundary rather than
-    /// propagating inward as a plausible-looking handle.
-    #[must_use]
-    pub fn parse(raw: &str) -> Option<Self> {
-        let digest = raw.strip_prefix(TERM_ADDR_PREFIX)?;
-        Self::from_digest(digest)
-    }
-
-    /// The stored form, as a string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    /// The digest portion, without the prefix.
-    #[must_use]
-    pub fn digest(&self) -> &str {
-        self.0.strip_prefix(TERM_ADDR_PREFIX).expect(
-            "invariant: every TermAddr is constructed with the prefix and the field is private",
-        )
-    }
+    /// The address is a content address: it is derived from the term's
+    /// canonical encoding, so identical encodings share an address and
+    /// different encodings never collide in practice.
+    TermAddr
 }
 
-impl fmt::Display for TermAddr {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl AsRef<str> for TermAddr {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
+content_address! {
+    /// An opaque handle to a stored cospan.
+    ///
+    /// The address is a content address of the cospan's *presentation* — its
+    /// two leg maps and its labelled apex, exactly as the caller built them.
+    /// Two presentations of the same morphism therefore have different
+    /// addresses; what identifies them as one morphism is the canonical key
+    /// (see [`crate::cospan`]), which is a separate, uniquely-indexed column.
+    CospanAddr
 }
 
 #[cfg(test)]
@@ -153,5 +213,35 @@ mod tests {
             addr.as_str().starts_with(|c: char| c.is_ascii_alphabetic()),
             "{addr}"
         );
+    }
+
+    /// The second address type is generated from the same macro, so it must
+    /// validate identically — the point of generating it rather than writing it
+    /// out is that these cannot drift apart.
+    #[test]
+    fn cospan_addresses_validate_exactly_as_term_addresses_do() {
+        let addr =
+            CospanAddr::from_digest(DIGEST).expect("64 lowercase hex chars is a valid digest");
+        assert_eq!(addr.as_str(), format!("b3_{DIGEST}"));
+        assert_eq!(addr.digest(), DIGEST);
+        assert_eq!(CospanAddr::parse(addr.as_str()), Some(addr));
+
+        assert_eq!(CospanAddr::from_digest(&DIGEST[..63]), None);
+        assert_eq!(CospanAddr::from_digest(&DIGEST.to_uppercase()), None);
+        assert_eq!(CospanAddr::parse(DIGEST), None);
+        assert_eq!(CospanAddr::parse(""), None);
+    }
+
+    /// Derived key columns share the address shape exactly, so a key can be
+    /// parsed as an address (which is how a cospan's record id is recovered).
+    #[test]
+    fn derived_keys_share_the_address_shape() {
+        let key = digest_key(b"whatever");
+        assert!(key.starts_with("b3_"), "{key}");
+        assert_eq!(key.len(), 3 + 64);
+        assert!(CospanAddr::parse(&key).is_some());
+        // Deterministic, which is the property a key column lives or dies by.
+        assert_eq!(key, digest_key(b"whatever"));
+        assert_ne!(key, digest_key(b"something else"));
     }
 }

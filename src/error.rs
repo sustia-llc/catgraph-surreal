@@ -200,6 +200,47 @@ pub enum StoreError {
         saw: u64,
     },
 
+    /// A unique index refused a write: an equivalent record is already stored
+    /// under a different id.
+    ///
+    /// This is not a conflict and not corruption — it is the database enforcing
+    /// an identity the store declared. The cospan tier raises it when a second
+    /// *presentation* of an already-stored morphism is written: the two rows
+    /// have different content addresses but one canonical key, and the store
+    /// keeps one presentation per morphism. Recovering the address of the
+    /// presentation that is already there is a read, not a retry —
+    /// [`CospanStore::find_by_canon`](crate::CospanStore::find_by_canon).
+    #[error(
+        "`{table}` already holds an equivalent record; the unique index `{index}` refused the write"
+    )]
+    Duplicate {
+        /// The table whose index refused the write.
+        table: String,
+        /// The index that refused it.
+        index: String,
+    },
+
+    /// A write-once column was written with a *changed* value.
+    ///
+    /// Every stored column in this crate is `READONLY`, so a record's contents
+    /// are fixed once written. Re-writing an identical value is a no-op and
+    /// raises nothing — only a change does, which is what makes this the alarm
+    /// rather than the noise.
+    ///
+    /// What it means depends on the tier, and the difference is worth keeping in
+    /// view. For the weight tier it is *reachable by design*: a weight vector is
+    /// immutable under its key, so training that wants a new vector supplies a
+    /// new key. For the content-addressed tiers it is unreachable short of a
+    /// digest collision, which is why those leave it as a raw database error
+    /// rather than dressing it up as an expected outcome.
+    #[error("`{table}.{field}` is write-once; the write changed its value")]
+    ReadOnly {
+        /// The table the column belongs to.
+        table: String,
+        /// The column that refused the change.
+        field: String,
+    },
+
     /// A write-once record was targeted by an update or delete.
     ///
     /// Store-side immutability is the primary guard; the database-side event is
@@ -256,6 +297,45 @@ impl StoreError {
             _ => false,
         }
     }
+}
+
+/// Whether an error is the engine reporting that `table` is undefined.
+///
+/// Message-keyed by necessity — the raise carries no structured discriminator —
+/// and scoped to the exact rendering for one table so it cannot swallow an
+/// unrelated failure. Every repository that uses it pins it with an integration
+/// test that removes a real table, which is the discipline that keeps a
+/// message-keyed classifier honest.
+pub(crate) fn is_missing_table(e: &surrealdb::Error, table: &str) -> bool {
+    e.message()
+        .contains(&format!("The table '{table}' does not exist"))
+}
+
+/// Whether an error is a unique index on `table` refusing a write.
+///
+/// Also message-keyed, and also pinned by an integration test that provokes a
+/// real collision. It is scoped to the index by name, so an unrelated index on
+/// the same table cannot be mistaken for this one.
+pub(crate) fn is_duplicate(e: &surrealdb::Error, index: &str) -> bool {
+    e.message()
+        .contains(&format!("Database index `{index}` already contains"))
+}
+
+/// Whether an error is a `READONLY` column refusing a changed value, and if so
+/// which column.
+///
+/// Message-keyed for the same reason as its neighbours, and matched against the
+/// caller's own column list so an unfamiliar field name is *not* claimed as one
+/// of ours. Pinned by an integration test that provokes a real refusal.
+pub(crate) fn read_only_field(e: &surrealdb::Error, fields: &[&str]) -> Option<String> {
+    let message = e.message();
+    if !message.contains("but field is readonly") {
+        return None;
+    }
+    fields
+        .iter()
+        .find(|field| message.contains(&format!("field `{field}`")))
+        .map(|field| (*field).to_owned())
 }
 
 /// The store's result alias.
@@ -359,6 +439,14 @@ mod tests {
                 table: "manifest".to_owned(),
                 event: "manifest_no_update".to_owned(),
             },
+            StoreError::Duplicate {
+                table: "cospan".to_owned(),
+                index: "cospan_canon".to_owned(),
+            },
+            StoreError::ReadOnly {
+                table: "weight".to_owned(),
+                field: "coordinates".to_owned(),
+            },
         ];
         for err in cases {
             assert!(!err.is_conflict(), "{err} must not classify as a conflict");
@@ -388,6 +476,41 @@ mod tests {
             detail: "nesting depth 300 exceeds limit 256".to_owned(),
         };
         assert!(err.to_string().contains("depth"), "{err}");
+    }
+
+    /// Both message-keyed classifiers must be scoped tightly enough that an
+    /// unrelated failure cannot satisfy them. The integration suites pin the
+    /// positive cases against a real engine; this pins the negatives.
+    #[test]
+    fn message_keyed_classifiers_are_scoped_to_their_subject() {
+        let missing = surrealdb::Error::query("The table 'term' does not exist".to_owned(), None);
+        assert!(is_missing_table(&missing, "term"));
+        assert!(!is_missing_table(&missing, "cospan"));
+
+        let duplicate = surrealdb::Error::query(
+            "Database index `cospan_canon` already contains 'b3_0', with record `cospan:b3_1`"
+                .to_owned(),
+            None,
+        );
+        assert!(is_duplicate(&duplicate, "cospan_canon"));
+        assert!(!is_duplicate(&duplicate, "weight_key"));
+        assert!(!is_duplicate(&missing, "cospan_canon"));
+
+        let read_only = surrealdb::Error::query(
+            "Found changed value for field `coordinates`, with record `weight:b3_0`, \
+             but field is readonly"
+                .to_owned(),
+            None,
+        );
+        assert_eq!(
+            read_only_field(&read_only, &["dim", "coordinates"]).as_deref(),
+            Some("coordinates")
+        );
+        // A column this caller does not own must not be claimed as one of its
+        // own — the classifier reports which field, and a wrong answer is worse
+        // than none.
+        assert_eq!(read_only_field(&read_only, &["dim", "finite"]), None);
+        assert_eq!(read_only_field(&missing, &["coordinates"]), None);
     }
 
     /// The catgraph bridge has to be a real `#[from]`, so `?` works across the
