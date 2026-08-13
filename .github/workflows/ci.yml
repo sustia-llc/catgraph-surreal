@@ -54,6 +54,10 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      # `--locked` matters here as much as in the main job: without it this
+      # lane silently re-resolves a stale Cargo.lock in-runner and reports
+      # green against a dependency graph nobody committed.
+      #
       # `--lib` only: the dev-dependency graph (tokio's test macros) does not
       # build for this target.
-      - run: cargo check --lib --no-default-features --features wasm --target wasm32-unknown-unknown
+      - run: cargo check --locked --lib --no-default-features --features wasm --target wasm32-unknown-unknown

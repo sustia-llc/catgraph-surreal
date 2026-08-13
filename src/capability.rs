@@ -3,17 +3,26 @@
 //! # Why this module exists
 //!
 //! Not every transport can do everything, and the SDK does not tell you until
-//! you try. The split that matters here:
+//! you try. The split that matters, on a native target:
 //!
 //! | Endpoint | Backup (export/import) | Live queries |
 //! |---|---|---|
 //! | `memory` / `mem://` | yes | yes |
 //! | `rocksdb://` | yes | yes |
 //! | `surrealkv://` | yes | yes |
-//! | `tikv://` | yes | yes |
 //! | `http://`, `https://` | yes | **no** |
 //! | `ws://`, `wss://` | **no** | yes |
-//! | `indxdb://` (wasm) | **no** | yes |
+//!
+//! On a **wasm** target the SDK grants `Backup` to *no* endpoint at all — every
+//! engine it dispatches (including `indxdb://`, the only one this crate's
+//! `wasm` feature enables) gets live queries only. The table this module
+//! consults is target-conditional to match.
+//!
+//! Schemes this crate has no feature for (`tikv://`, and `indxdb://` on native,
+//! where the SDK itself rejects it) are deliberately *not* in the table:
+//! advertising a capability verdict for an endpoint no build of this crate can
+//! serve would make the fail-fast promise a lie. They fall through to the
+//! unknown-scheme deferral and get the SDK's own "engine not enabled" error.
 //!
 //! A store configured to both checkpoint and subscribe therefore cannot run on a
 //! single remote transport — it needs both, which is why the `server` feature
@@ -137,22 +146,35 @@ impl EndpointCapabilities {
     }
 }
 
-/// The scheme portion of an endpoint string, lowercased.
+/// The scheme portion of an endpoint string, lowercased and normalised.
 ///
-/// Handles the bare aliases the SDK accepts for the in-memory engine
-/// (`memory`, `memory?...`) alongside ordinary `scheme://rest` forms.
+/// Mirrors the SDK's own endpoint grammar, which is looser than `scheme://`:
+/// it splits at `"://"`, **falls back to the first `:`** (`ws:127.0.0.1:8000`,
+/// `rocksdb:/var/lib/db` — the form the SDK's own docs use), and otherwise
+/// treats the whole string as the scheme (bare `mem`, bare `memory`). A
+/// checker recognising only the double-slash form silently skips every other
+/// form the SDK happily connects. The `?options` suffix the in-memory engine
+/// accepts is stripped, and `memory` normalises to `mem`.
 fn scheme_of(endpoint: &str) -> Option<String> {
     let trimmed = endpoint.trim();
-    if trimmed.eq_ignore_ascii_case("memory") || trimmed.to_ascii_lowercase().starts_with("memory?")
-    {
-        return Some("mem".to_owned());
+    let head = trimmed.split_once("://").map_or_else(
+        || {
+            trimmed
+                .split_once(':')
+                .map_or(trimmed, |(scheme, _)| scheme)
+        },
+        |(scheme, _)| scheme,
+    );
+    let head = head.split_once('?').map_or(head, |(scheme, _)| scheme);
+    if head.is_empty() {
+        return None;
     }
-    let (scheme, _) = trimmed.split_once("://")?;
-    if scheme.is_empty() {
-        None
+    let scheme = head.to_ascii_lowercase();
+    Some(if scheme == "memory" {
+        "mem".to_owned()
     } else {
-        Some(scheme.to_ascii_lowercase())
-    }
+        scheme
+    })
 }
 
 /// The capabilities granted by an endpoint, or `None` for an unrecognised
@@ -164,15 +186,40 @@ fn scheme_of(endpoint: &str) -> Option<String> {
 /// nobody.
 #[must_use]
 pub fn capabilities_of(endpoint: &str) -> Option<EndpointCapabilities> {
-    match scheme_of(endpoint)?.as_str() {
+    caps_for(scheme_of(endpoint)?.as_str())
+}
+
+/// The native-target table, mirroring the SDK's native scheme dispatch.
+///
+/// `tikv` is absent on purpose — no feature of this crate enables the SDK's
+/// `kv-tikv`, so no build can serve it; `indxdb` is absent because the SDK
+/// rejects it natively. Both defer to the SDK's own connection error.
+#[cfg(not(target_family = "wasm"))]
+fn caps_for(scheme: &str) -> Option<EndpointCapabilities> {
+    match scheme {
         // Local engines: full capability.
-        "mem" | "rocksdb" | "surrealkv" | "tikv" => Some(EndpointCapabilities::new(true, true)),
+        "mem" | "rocksdb" | "surrealkv" => Some(EndpointCapabilities::new(true, true)),
         // HTTP carries backups but cannot subscribe.
         "http" | "https" => Some(EndpointCapabilities::new(true, false)),
         // WebSocket subscribes but cannot export.
         "ws" | "wss" => Some(EndpointCapabilities::new(false, true)),
-        // The browser engine subscribes but has no backup path.
-        "indxdb" => Some(EndpointCapabilities::new(false, true)),
+        _ => None,
+    }
+}
+
+/// The wasm-target table, mirroring the SDK's wasm scheme dispatch — which
+/// grants `Backup` to **no** endpoint at all. Advertising the native table here
+/// would pass a `require_backup()` check that the first `export()` then fails
+/// with an undiscriminated internal error, defeating the module's purpose.
+#[cfg(target_family = "wasm")]
+fn caps_for(scheme: &str) -> Option<EndpointCapabilities> {
+    match scheme {
+        // Every engine the SDK dispatches on wasm gets live queries only.
+        "indxdb" | "mem" | "rocksdb" | "surrealkv" | "ws" | "wss" => {
+            Some(EndpointCapabilities::new(false, true))
+        }
+        // HTTP on wasm receives no capability grants at all.
+        "http" | "https" => Some(EndpointCapabilities::new(false, false)),
         _ => None,
     }
 }
@@ -228,15 +275,55 @@ mod tests {
     }
 
     #[test]
-    fn schemes_are_lowercased_and_unparseable_endpoints_yield_none() {
+    fn schemes_are_lowercased_and_empty_schemes_yield_none() {
         assert_eq!(scheme_of("WSS://example.test").as_deref(), Some("wss"));
         assert_eq!(scheme_of("rocksdb:///tmp/data").as_deref(), Some("rocksdb"));
-        assert_eq!(scheme_of("no-scheme-here"), None);
         assert_eq!(scheme_of("://missing"), None);
+        assert_eq!(scheme_of(""), None);
+    }
+
+    /// The SDK's grammar is looser than `scheme://` — single-colon and bare
+    /// forms genuinely connect, so the checker must resolve them too or the
+    /// capability check silently skips exactly the endpoints users type from
+    /// the SDK's own documentation.
+    #[test]
+    fn sdk_accepted_colon_and_bare_forms_resolve() {
+        assert_eq!(scheme_of("ws:127.0.0.1:8000").as_deref(), Some("ws"));
+        assert_eq!(scheme_of("rocksdb:/var/lib/db").as_deref(), Some("rocksdb"));
+        assert_eq!(scheme_of("mem").as_deref(), Some("mem"));
+        // A schemeless word resolves to itself and then falls through the
+        // capability table to the unknown-scheme deferral.
+        assert_eq!(
+            scheme_of("no-scheme-here").as_deref(),
+            Some("no-scheme-here")
+        );
+    }
+
+    /// The regression that motivated the grammar fix: a single-colon WebSocket
+    /// endpoint really connects (LiveQueries only), so requiring backup on it
+    /// must fail HERE, not hours later at the first export.
+    #[test]
+    fn single_colon_websocket_is_rejected_when_backup_is_required() {
+        let err = check("ws:127.0.0.1:8000", Requirements::none().with_backup())
+            .expect_err("single-colon ws form must not bypass the check");
+        assert!(!err.is_conflict());
+        assert!(!err.is_shutdown());
+    }
+
+    /// Schemes no build of this crate can serve (no cargo feature maps to
+    /// them) must defer to the SDK's engine-not-enabled error rather than
+    /// advertise a capability verdict.
+    #[test]
+    fn featureless_schemes_defer_to_the_connection_attempt() {
+        assert_eq!(capabilities_of("tikv://pd:2379"), None);
+        #[cfg(not(target_family = "wasm"))]
+        assert_eq!(capabilities_of("indxdb://mydb"), None);
     }
 
     /// The whole point of the module: the two remote transports are
-    /// complementary, never interchangeable.
+    /// complementary, never interchangeable. (Native truth — on wasm the SDK
+    /// grants Backup to nothing, which the wasm table mirrors.)
+    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn remote_transports_have_complementary_capabilities() {
         let http = capabilities_of("http://example.test").expect("http is a known scheme");
@@ -248,6 +335,7 @@ mod tests {
         assert!(ws.grants(Capability::LiveQueries));
     }
 
+    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn local_engines_grant_everything() {
         for endpoint in ["memory", "mem://", "rocksdb:///tmp/x", "surrealkv:///tmp/y"] {
@@ -257,6 +345,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn a_local_engine_satisfies_every_requirement() {
         let all = Requirements::none().with_backup().with_live_queries();

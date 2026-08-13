@@ -35,18 +35,19 @@ exercised as a requirement rather than assumed.
 
 ## Usage
 
-```rust,no_run
-use catgraph_surreal::StoreBuilder;
+```rust
+use catgraph_surreal::{Result, StoreBuilder};
 
-# async fn example() -> catgraph_surreal::Result<()> {
-let store = StoreBuilder::new("rocksdb:///var/lib/catgraph")
-    .namespace("catgraph")
-    .database("main")
-    .require_backup()
-    .connect()
-    .await?;
-# Ok(())
-# }
+async fn open() -> Result<()> {
+    let store = StoreBuilder::new("rocksdb:///var/lib/catgraph")
+        .namespace("catgraph")
+        .database("main")
+        .require_backup()
+        .connect()
+        .await?;
+    let _ = store;
+    Ok(())
+}
 ```
 
 ## Engines
@@ -67,9 +68,9 @@ purely embedded build.
 
 Two engine caveats worth knowing before picking one:
 
-- **SurrealKV commits are not fsyncs.** Every transaction commits with eventual
-  durability, leaving the sync to the operating system. Data whose loss would be
-  silent should not live there without a durability soak first.
+- **SurrealKV is the unsoaked engine.** It is documented as beta for embedded
+  use and has no durability soak history behind it here. Data whose loss would
+  be silent should not live there until a soak says otherwise.
 - **Conflict behaviour is engine-specific.** The in-memory engine aborts on read
   conflicts too, RocksDB detects at commit time, SurrealKV detects write
   conflicts only. Retry tuning measured on the memory engine does not transfer.
@@ -110,9 +111,10 @@ loses data rather than merely erroring:
   including the result of `commit()`. Some engines only detect conflicts at
   commit time, so a transaction whose statements all succeeded can still fail
   there.
-- Shutdown has **no structured discriminator** — the engine maps it onto the same
-  detail as an ordinary connection failure — so `is_shutdown()` necessarily keys
-  on message text as well as error class.
+- Shutdown has **no structured discriminator**, and it surfaces in *different
+  error classes* depending on the path (the embedded commit slot reports it as a
+  query-class error; RPC-handler paths as connection-class) — so `is_shutdown()`
+  necessarily keys on message text alone, across classes.
 
 ## MSRV
 

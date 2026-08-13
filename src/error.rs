@@ -28,14 +28,20 @@
 //!
 //! ## Shutdown: no structured discriminator exists
 //!
-//! A datastore shutdown is deliberately mapped by the engine onto the *same*
-//! structured discriminator as an ordinary network failure
-//! (`ConnectionError::ConnectionFailed`), so the two cannot be told apart by
-//! matching on error details alone. `is_shutdown()` therefore keys on the
-//! message text in addition to the connection class. The upstream type documents
-//! why the distinction matters: a commit refused during shutdown is usually
-//! refused *before* it applied, and callers that persist failure state "must
-//! therefore not record this as a permanent error".
+//! A datastore shutdown has **no structured discriminator of its own** and
+//! surfaces in *different error classes* depending on the path that hits it:
+//!
+//! - the embedded executor's commit slot reports it as a **query-class** error
+//!   (`"Cannot COMMIT: …"` with `QueryError::NotExecuted`) — the shape a
+//!   store transaction actually sees;
+//! - RPC-handler commit paths report it as a **connection-class** error
+//!   wrapped by the key-value layer.
+//!
+//! `is_shutdown()` therefore keys on the message text alone, across classes.
+//! The upstream type documents why the distinction matters: a commit refused
+//! during shutdown is usually refused *before* it applied, and callers that
+//! persist failure state "must therefore not record this as a permanent
+//! error".
 //!
 //! A plain connection failure is a *different* condition with the *same* remedy.
 //! Code asking "should I reconnect and retry?" should treat both alike rather
@@ -47,8 +53,14 @@ use thiserror::Error;
 
 /// The exact message an engine reports when it refuses work during shutdown.
 ///
-/// Reaches [`StoreError::is_shutdown`] as a substring: the key-value layer wraps
-/// it as `"There was a problem with the key-value store: {this}"`.
+/// Reaches [`StoreError::is_shutdown`] as a substring under two wrappings: the
+/// embedded commit slot's `"Cannot COMMIT: {this}"` and the key-value layer's
+/// `"There was a problem with the key-value store: {this}"`.
+///
+/// ⚠ Mirrored from upstream wording with nothing upstream pinning it: every
+/// test here fabricates the string it asserts, so an SDK rewording would keep
+/// CI green while silently killing the classifier. **Re-verify this constant
+/// against `surrealdb-core` on every SDK upgrade** (`rg "shutting down"`).
 const SHUTDOWN_MESSAGE: &str = "The datastore is shutting down";
 
 /// Which step of the revalidation-on-load discipline rejected a document.
@@ -176,15 +188,16 @@ pub enum StoreError {
     /// A write-once record was targeted by an update or delete.
     ///
     /// Store-side immutability is the primary guard; the database-side event is
-    /// defence in depth. Two properties of that backing event shape detection:
-    ///
-    /// - The database wraps a throwing event's error as
-    ///   `"Error while processing event {name}: {cause}"`, so detection keys on
-    ///   the **event name** inside the wrapped text, not on the inner message.
-    /// - A no-op write — one that sets a field to the value it already holds —
-    ///   fires no event and raises no read-only error at all. Tests asserting
-    ///   immutability must therefore write a *changed* value, or they pass
-    ///   vacuously.
+    /// defence in depth. How a rejecting event's error is detected and mapped
+    /// onto this variant is **decided when the write-once tables land**, pinned
+    /// there by tests against the real engine — nothing here prescribes
+    /// upstream message wording, deliberately (an untested transcription of
+    /// upstream text is exactly the fragility [`is_shutdown`](Self::is_shutdown)
+    /// has to manage, and this variant has no mitigation yet). One engine
+    /// property those tests must respect: a no-op write — one that sets a field
+    /// to the value it already holds — fires no event and raises no read-only
+    /// error at all, so immutability tests must write a *changed* value or they
+    /// pass vacuously.
     #[error("`{table}` is write-once; `{event}` rejected the write")]
     Immutable {
         /// The write-once table.
@@ -215,14 +228,16 @@ impl StoreError {
     /// Such a failure is **not permanent**: reconnect and retry. Callers that
     /// persist failure state must not record it as terminal.
     ///
-    /// Keyed on message text by necessity — the engine maps shutdown onto the
-    /// same structured discriminator as an ordinary connection failure, so no
-    /// structured match can separate them. See the [module
+    /// Keyed on message text alone, deliberately across error classes: the
+    /// embedded commit slot reports shutdown as a *query-class* error while
+    /// RPC-handler paths report it as *connection-class*, and no structured
+    /// discriminator separates either from its neighbours. Restricting to one
+    /// class silently misses the other producer. See the [module
     /// documentation](self).
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
         match self {
-            Self::Db(e) => e.is_connection() && e.to_string().contains(SHUTDOWN_MESSAGE),
+            Self::Db(e) => e.message().contains(SHUTDOWN_MESSAGE),
             _ => false,
         }
     }
@@ -259,13 +274,28 @@ mod tests {
         assert!(!err.is_conflict());
     }
 
-    /// Shutdown arrives as a connection-class error whose message carries the
-    /// engine's shutdown text, wrapped by the key-value layer.
+    /// Shutdown's RPC-handler shape: a connection-class error whose message
+    /// carries the engine's shutdown text, wrapped by the key-value layer.
     #[test]
     fn shutdown_is_classified_from_connection_class_and_message() {
         let err = StoreError::Db(surrealdb::Error::connection(
             format!("There was a problem with the key-value store: {SHUTDOWN_MESSAGE}"),
             ConnectionError::ConnectionFailed,
+        ));
+        assert!(err.is_shutdown());
+        assert!(!err.is_conflict());
+    }
+
+    /// Shutdown's embedded-commit shape: the executor reports it on the COMMIT
+    /// slot as a *query-class* error (`QueryError::NotExecuted`), not a
+    /// connection error. This is the shape a store transaction actually sees,
+    /// and a classifier restricted to the connection class returns false for
+    /// exactly the case it exists to catch.
+    #[test]
+    fn shutdown_is_classified_from_the_embedded_commit_slot() {
+        let err = StoreError::Db(surrealdb::Error::query(
+            format!("Cannot COMMIT: {SHUTDOWN_MESSAGE}"),
+            QueryError::NotExecuted,
         ));
         assert!(err.is_shutdown());
         assert!(!err.is_conflict());

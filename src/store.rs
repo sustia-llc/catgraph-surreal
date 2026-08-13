@@ -87,16 +87,21 @@ impl StoreBuilder {
 
 /// An open connection to the backing database.
 ///
-/// # Sessions, and why `Arc` is the wrong tool for transactions
+/// # Sessions and transactions
 ///
-/// Starting a transaction **consumes** the handle, so a shared
-/// `Arc<Store>` cannot begin one — there is nothing to consume. The two
-/// sharing modes are therefore not interchangeable:
+/// Starting a transaction consumes an **owned** `Surreal` handle. That does
+/// not strand a shared `Arc<Store>`: [`Self::session`] mints a fresh owned
+/// handle from a shared reference, so `store.session().begin()` works from
+/// behind an `Arc`. The distinction that actually matters is *sessions*:
 ///
-/// - **Per-worker [`Clone`]** — each clone is a *new session*, snapshot-
-///   inheriting namespace, database, auth, and variables at the moment of the
-///   clone. This is what concurrent transaction workers need: one clone each.
-/// - **`Arc<Store>`** — one shared session, for non-transactional use only.
+/// - **One session per concurrent transaction worker.** Each [`Self::session`]
+///   call (equivalently, each [`Clone`] of the handle) is a *new session*,
+///   snapshot-inheriting namespace, database, auth, and variables at the
+///   moment it is minted; sessions are the isolation boundary that makes
+///   `TransactionConflict` meaningful.
+/// - **A shared handle is a shared session.** Fine for plain concurrent
+///   queries; for transactions, mint a session per worker rather than
+///   funnelling workers through one.
 ///
 /// # Background tasks
 ///

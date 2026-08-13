@@ -41,9 +41,10 @@
 //!
 //! Two engine caveats worth knowing before choosing one:
 //!
-//! - **SurrealKV commits are not fsyncs.** Every transaction commits with
-//!   eventual durability, leaving the sync to the operating system. Data whose
-//!   loss would be silent should not live here without a durability soak first.
+//! - **SurrealKV is the unsoaked engine.** It is documented as beta for
+//!   embedded use, detects write conflicts only, and has no durability soak
+//!   history behind it here. Data whose loss would be silent should not live
+//!   on it until a soak says otherwise.
 //! - **Conflict behaviour differs per engine.** The in-memory engine aborts on
 //!   read conflicts too, RocksDB detects at commit time, SurrealKV detects write
 //!   conflicts only. Retry tuning measured on the memory engine does not
@@ -65,6 +66,12 @@
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+// Compile the README's code fences as doctests, so the Usage example cannot
+// drift from the real API without CI noticing.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme_doctests {}
 
 pub mod addr;
 pub mod capability;

@@ -26,9 +26,8 @@ default = ["rocksdb"]
 mem = ["surrealdb/kv-mem"]
 # Primary durable embedded engine.
 rocksdb = ["surrealdb/kv-rocksdb"]
-# SurrealKV. Every transaction commits with `Durability::Eventual` (commit is not
-# fsync), so this engine is gated on a durability soak before it carries data
-# whose loss would be silent.
+# SurrealKV. Documented beta for embedded use, with no durability soak history
+# here — gated on that soak before it carries data whose loss would be silent.
 kv = ["surrealdb/kv-surrealkv"]
 # Server-tier client. BOTH transports on purpose: the capability split is real —
 # HTTP grants Backup but no live queries, WS grants live queries but no Backup.
@@ -44,15 +43,13 @@ surrealdb = { version = "3.2.4", default-features = false }
 
 # catgraph over the git tag via HTTPS, never a path dependency: an external
 # consumer's CI has to be able to fetch this crate and its dependencies.
+#
+# `catgraph-applied` (with `serde` — the term tier round-trips
+# `ColoredExpr`/`PropExpr`) and `catgraph-dl` (without `serde` — weights persist
+# as raw IEEE-754 bytes through the public `dim()`/`as_slice()`/`new()`
+# surface) enter with the repositories that use them; declaring them ahead of
+# any use would make every consumer fetch and compile them for nothing.
 catgraph = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.11.0" }
-# `serde` is required — the term tier round-trips `ColoredExpr`/`PropExpr`.
-catgraph-applied = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.11.0", features = [
-    "serde",
-] }
-# NO `serde` feature: `RModule<f64>` weights persist as `bytes` (dim x 8
-# IEEE-754 LE), reached through the public `dim()`/`as_slice()`/`new()` surface.
-# dl's serde derives would only be needed for a generic scalar `S` or `Dual`.
-catgraph-dl = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.11.0" }
 
 thiserror = "2"
 serde_json = "1"
