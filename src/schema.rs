@@ -20,6 +20,19 @@
 //!   admits `NONE`, so `option<T>` and `any` would quietly disarm the guards
 //!   below.
 //!
+//! # The drift guard compares definitions, not names
+//!
+//! [`assert_term_schema`] compares the **engine-rendered definition strings**
+//! (`INFO FOR DB` / `INFO FOR TABLE`) against the ones this build expects — not
+//! merely the field and index *names*. A name-only check is blind to exactly
+//! the drift that disarms the guards: `ALTER TABLE … SCHEMALESS` keeps every
+//! field defined, a dropped `READONLY` clause keeps the field's name, and a
+//! field re-typed to `option<T>` still answers to its name. The definition
+//! strings are the engine's own normalization at SurrealDB 3.2.4, pinned by an
+//! integration test against a fresh bootstrap — an SDK upgrade that changes the
+//! rendering fails that test loudly, which is the moment to re-pin the strings
+//! deliberately rather than discover the change in production.
+//!
 //! # The guards are defence in depth, not the trust boundary
 //!
 //! On an embedded connection with no root user configured, table and field
@@ -29,6 +42,8 @@
 //! anything: the store's own validation is the trust boundary and the database
 //! backs it up. This is why [`crate::term`]'s revalidation runs on every load
 //! and why a restore re-verifies term ids rather than trusting the replay.
+
+use std::collections::BTreeMap;
 
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
@@ -41,9 +56,10 @@ pub const TERM_TABLE: &str = "term";
 /// Every column the [`TERM_TABLE`] schema declares, in the order the DDL
 /// defines them.
 ///
-/// The drift guard compares this set against the live schema, so adding a
-/// column means adding it here *and* to the DDL — a mismatch between the two is
-/// caught by a unit test in this module rather than at run time.
+/// The read projection is derived from this list, and the drift guard's
+/// expected definitions are pinned to the same names by a unit test — adding a
+/// column means touching this list, the DDL, and [`TERM_FIELD_DEFINITIONS`]
+/// together, and any mismatch is caught in-process rather than at run time.
 pub const TERM_FIELDS: [&str; 9] = [
     "id",
     "term_json",
@@ -65,6 +81,63 @@ pub const TERM_FIELDS: [&str; 9] = [
 /// identity proper is the record id, which *is* the content address — no
 /// separate unique key column exists or is wanted.
 pub const TERM_INDEXES: [&str; 1] = ["term_nf_class"];
+
+/// The term table's own definition, as the engine renders it.
+///
+/// `SCHEMAFULL` is the load-bearing token: `ALTER TABLE term SCHEMALESS`
+/// renders as `TYPE NORMAL SCHEMALESS` and fails the comparison, which is the
+/// entire point — a schemaless term table accepts undeclared columns and
+/// silently disarms every field guard.
+pub const TERM_TABLE_DEFINITION: &str = "DEFINE TABLE term TYPE NORMAL SCHEMAFULL PERMISSIONS NONE";
+
+/// Every column's definition, as the engine renders it.
+///
+/// These strings carry the guards the name-only view cannot see: the `READONLY`
+/// clause on every derived column, the non-optional types, and the id `ASSERT`.
+pub const TERM_FIELD_DEFINITIONS: [(&str, &str); 9] = [
+    (
+        "id",
+        "DEFINE FIELD id ON term TYPE string ASSERT record::id($value) = /^b3_[0-9a-f]{64}$/ PERMISSIONS FULL",
+    ),
+    (
+        "term_json",
+        "DEFINE FIELD term_json ON term TYPE string READONLY PERMISSIONS FULL",
+    ),
+    (
+        "codec",
+        "DEFINE FIELD codec ON term TYPE string READONLY PERMISSIONS FULL",
+    ),
+    (
+        "signature",
+        "DEFINE FIELD signature ON term TYPE string READONLY PERMISSIONS FULL",
+    ),
+    (
+        "source_arity",
+        "DEFINE FIELD source_arity ON term TYPE int READONLY PERMISSIONS FULL",
+    ),
+    (
+        "target_arity",
+        "DEFINE FIELD target_arity ON term TYPE int READONLY PERMISSIONS FULL",
+    ),
+    (
+        "depth",
+        "DEFINE FIELD depth ON term TYPE int READONLY PERMISSIONS FULL",
+    ),
+    (
+        "generator_count",
+        "DEFINE FIELD generator_count ON term TYPE int READONLY PERMISSIONS FULL",
+    ),
+    (
+        "nf_class",
+        "DEFINE FIELD nf_class ON term TYPE string READONLY PERMISSIONS FULL",
+    ),
+];
+
+/// Every declared index's definition, as the engine renders it.
+pub const TERM_INDEX_DEFINITIONS: [(&str, &str); 1] = [(
+    "term_nf_class",
+    "DEFINE INDEX term_nf_class ON term FIELDS nf_class",
+)];
 
 /// The term table's DDL.
 ///
@@ -100,19 +173,23 @@ DEFINE FIELD IF NOT EXISTS nf_class ON term TYPE string READONLY;
 DEFINE INDEX IF NOT EXISTS term_nf_class ON term FIELDS nf_class;
 ";
 
-/// Reads the live column names of the term table.
-const TERM_FIELD_KEYS: &str = "RETURN object::keys((INFO FOR TABLE term).fields)";
-
-/// Reads the live index names of the term table.
-const TERM_INDEX_KEYS: &str = "RETURN object::keys((INFO FOR TABLE term).indexes)";
+/// Reads the term table's own rendered definition (or `NONE` if undefined),
+/// its field definitions, and its index definitions, in that order.
+const TERM_INFO: &str = "\
+RETURN (INFO FOR DB).tables.term;
+RETURN (INFO FOR TABLE term).fields;
+RETURN (INFO FOR TABLE term).indexes;
+";
 
 /// Define the term table, its columns, and its indexes.
 ///
 /// Idempotent: running it against an already-bootstrapped database changes
 /// nothing. It finishes by running [`assert_term_schema`], so a database whose
 /// schema has drifted out from under the DDL — a dropped column, a table
-/// carrying columns this version does not know — fails here rather than at the
-/// first read that quietly returns the wrong shape.
+/// carrying columns this version does not know, a table something else created
+/// implicitly before this ran (`IF NOT EXISTS` blesses the impostor rather
+/// than replacing it) — fails here rather than at the first read that quietly
+/// returns the wrong shape.
 ///
 /// # Errors
 ///
@@ -131,66 +208,85 @@ pub async fn bootstrap_terms(client: &Surreal<Any>) -> Result<()> {
 /// Bootstrapping would silently repair a dropped column (every statement is
 /// `IF NOT EXISTS`), so "bootstrap and hope" is not a substitute for asking.
 ///
-/// Columns must match **exactly**, in both directions. A missing column is
+/// **Definitions must match exactly, in both directions** — see the [module
+/// documentation](self) for why names alone are not enough. A missing column is
 /// obviously drift; an *extra* one means the database was written by a version
 /// of this store that knows a column this one does not, and reading it as if it
 /// were the older shape is how a newer document silently loses a field.
-/// Indexes are checked for presence only — an index this store does not declare
-/// is an operator's performance decision and costs correctness nothing.
+/// Declared indexes must match their expected definitions; an *extra* index is
+/// an operator's performance decision and costs correctness nothing.
 ///
-/// A table that does not exist at all reports an empty column set, so it lands
-/// here as drift rather than as an opaque "table not found".
+/// A table that does not exist at all reports no definition, so it lands here
+/// as drift rather than as an opaque "table not found".
 ///
 /// # Errors
 ///
 /// Returns [`StoreError::Schema`] naming the difference, or a database error if
 /// the schema could not be read.
 pub async fn assert_term_schema(client: &Surreal<Any>) -> Result<()> {
-    let fields = object_keys(client, TERM_FIELD_KEYS).await?;
-    let expected: Vec<String> = TERM_FIELDS.iter().map(|f| (*f).to_owned()).collect();
+    let mut response = client.query(TERM_INFO).await?;
+    let table: Option<String> = response.take(0)?;
+    let fields: Option<BTreeMap<String, String>> = response.take(1)?;
+    let indexes: Option<BTreeMap<String, String>> = response.take(2)?;
 
-    let missing = difference(&expected, &fields);
-    let unexpected = difference(&fields, &expected);
-    if !missing.is_empty() || !unexpected.is_empty() {
-        return Err(StoreError::Schema {
-            table: TERM_TABLE.to_owned(),
-            detail: format!(
-                "column set has drifted: missing [{}], unexpected [{}]",
-                missing.join(", "),
-                unexpected.join(", ")
-            ),
-        });
+    let Some(table) = table else {
+        return Err(drift("the table is not defined"));
+    };
+    if table != TERM_TABLE_DEFINITION {
+        return Err(drift(&format!(
+            "table definition is `{table}`, expected `{TERM_TABLE_DEFINITION}`"
+        )));
     }
 
-    let indexes = object_keys(client, TERM_INDEX_KEYS).await?;
-    let expected: Vec<String> = TERM_INDEXES.iter().map(|i| (*i).to_owned()).collect();
-    let missing = difference(&expected, &indexes);
-    if !missing.is_empty() {
-        return Err(StoreError::Schema {
-            table: TERM_TABLE.to_owned(),
-            detail: format!("index set has drifted: missing [{}]", missing.join(", ")),
-        });
-    }
+    let fields = fields.unwrap_or_default();
+    compare_definitions("column", &fields, &TERM_FIELD_DEFINITIONS, true)?;
+
+    let indexes = indexes.unwrap_or_default();
+    compare_definitions("index", &indexes, &TERM_INDEX_DEFINITIONS, false)?;
 
     Ok(())
 }
 
-/// Run a `RETURN object::keys(…)` statement and read the result.
+/// Compare live rendered definitions against the expected set.
 ///
-/// Taken as a `Vec<String>` rather than an `Option<Vec<String>>`: the result
-/// *is* the array, and asking for an option would make the SDK try to unwrap a
-/// single element out of it — which fails on every key count except one.
-async fn object_keys(client: &Surreal<Any>, statement: &str) -> Result<Vec<String>> {
-    let mut response = client.query(statement).await?;
-    Ok(response.take(0)?)
+/// `exact` demands the live set carry nothing beyond the expected one; indexes
+/// pass `false` so an operator-added index is tolerated.
+fn compare_definitions(
+    kind: &str,
+    live: &BTreeMap<String, String>,
+    expected: &[(&str, &str)],
+    exact: bool,
+) -> Result<()> {
+    for (name, definition) in expected {
+        match live.get(*name) {
+            None => return Err(drift(&format!("{kind} `{name}` is missing"))),
+            Some(found) if found != definition => {
+                return Err(drift(&format!(
+                    "{kind} `{name}` is defined as `{found}`, expected `{definition}`"
+                )));
+            }
+            Some(_) => {}
+        }
+    }
+    if exact {
+        for name in live.keys() {
+            if !expected
+                .iter()
+                .any(|(expected_name, _)| expected_name == name)
+            {
+                return Err(drift(&format!("unexpected {kind} `{name}`")));
+            }
+        }
+    }
+    Ok(())
 }
 
-/// The entries of `left` that do not appear in `right`.
-fn difference(left: &[String], right: &[String]) -> Vec<String> {
-    left.iter()
-        .filter(|entry| !right.contains(entry))
-        .cloned()
-        .collect()
+/// The uniform drift error.
+fn drift(detail: &str) -> StoreError {
+    StoreError::Schema {
+        table: TERM_TABLE.to_owned(),
+        detail: detail.to_owned(),
+    }
 }
 
 #[cfg(test)]
@@ -220,6 +316,32 @@ mod tests {
                 TERM_DDL.contains(&definition),
                 "`{index}` is declared but not defined in the DDL"
             );
+        }
+    }
+
+    /// The three statements of the column list — names, DDL, and expected
+    /// rendered definitions — must agree with each other.
+    #[test]
+    fn field_definitions_cover_exactly_the_declared_fields() {
+        let names: Vec<&str> = TERM_FIELD_DEFINITIONS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, TERM_FIELDS);
+        let index_names: Vec<&str> = TERM_INDEX_DEFINITIONS.iter().map(|(n, _)| *n).collect();
+        assert_eq!(index_names, TERM_INDEXES);
+    }
+
+    /// Every load-bearing token the guard exists to protect must actually be in
+    /// the expected definitions it compares against.
+    #[test]
+    fn expected_definitions_carry_the_guards() {
+        assert!(TERM_TABLE_DEFINITION.contains("SCHEMAFULL"));
+        for (name, definition) in TERM_FIELD_DEFINITIONS {
+            if name == "id" {
+                assert!(definition.contains("ASSERT record::id($value)"), "{name}");
+            } else {
+                assert!(definition.contains("READONLY"), "{name}");
+            }
+            assert!(!definition.contains("option<"), "{name}");
+            assert!(!definition.contains("TYPE any"), "{name}");
         }
     }
 
@@ -275,11 +397,41 @@ mod tests {
         assert!(!TERM_DDL.contains("$key"));
     }
 
+    /// The definition comparison rejects a changed definition, a missing entry,
+    /// and (when exact) an extra one — and tolerates the extra otherwise.
     #[test]
-    fn difference_reports_only_one_direction() {
-        let left = ["a".to_owned(), "b".to_owned()];
-        let right = ["b".to_owned(), "c".to_owned()];
-        assert_eq!(difference(&left, &right), vec!["a".to_owned()]);
-        assert_eq!(difference(&right, &left), vec!["c".to_owned()]);
+    fn definition_comparison_detects_each_drift_class() {
+        let expected = [("a", "DEFINE a"), ("b", "DEFINE b")];
+        let live = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+
+        assert!(
+            compare_definitions(
+                "column",
+                &live(&[("a", "DEFINE a"), ("b", "DEFINE b")]),
+                &expected,
+                true
+            )
+            .is_ok()
+        );
+        assert!(
+            compare_definitions(
+                "column",
+                &live(&[("a", "ALTERED"), ("b", "DEFINE b")]),
+                &expected,
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            compare_definitions("column", &live(&[("a", "DEFINE a")]), &expected, true).is_err()
+        );
+        let with_extra = live(&[("a", "DEFINE a"), ("b", "DEFINE b"), ("c", "DEFINE c")]);
+        assert!(compare_definitions("column", &with_extra, &expected, true).is_err());
+        assert!(compare_definitions("index", &with_extra, &expected, false).is_ok());
     }
 }

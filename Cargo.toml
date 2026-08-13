@@ -70,3 +70,12 @@ blake3 = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# The corrupt-document fixtures re-file tampered encodings under their own
+# digests, so the address check (which runs first) passes and the later
+# revalidation stages stay exercised.
+blake3 = "1"
+# Dev-only, and only to ENFORCE the mirror: `term::MAX_TERM_DEPTH` and
+# `term::term_depth` re-implement this crate's originals (the store persists
+# terms, it does not interpret them), and a test asserts the two stay in
+# agreement so an upstream change fails CI instead of silently diverging.
+catgraph-syntax = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.11.0", default-features = false }

@@ -69,18 +69,27 @@ beside it (`signature`, arities, `depth`, generator count, `nf_class`) are all
 derived from that string, and every one is re-derived and compared on load.
 
 **Loading always revalidates. There is no trusting path.** `ColoredExpr`'s
-`Deserialize` does not re-run the type check; database-side guards are void
-under `OPTION IMPORT` and are never evaluated at all on a default embedded
-connection. So every load runs four checks in a fixed order — JSON parse, depth,
-arity well-formedness, then a re-run of the type check against the stored
-signature — and the order is load-bearing: skipping the arity screen makes the
-next step abort rather than return an error.
+`Deserialize` does not re-run the type check, and every database-side guard is
+void under `OPTION IMPORT`. (On a default embedded connection the `PERMISSIONS`
+layer specifically is never evaluated — `ASSERT` and `READONLY` *do* run there,
+and the store's collision alarm relies on that — but none of it is the trust
+boundary.) So every load verifies the content address against the stored bytes
+first, then runs four checks in a fixed order — JSON parse, depth, arity
+well-formedness, then a re-run of the type check against the stored signature —
+and the order is load-bearing: skipping the arity screen makes the next step
+abort rather than return an error.
 
-**The generator type's `Serialize` must be deterministic.** No `HashMap` or
-`HashSet` in a generator's serde representation: their iteration order is
-unspecified, so two runs would encode one term two ways, producing two addresses
-and two rows for one term. Debug builds round-trip every encoding and assert the
-bytes reproduce, which catches this at the first write.
+**The generator type's `Serialize` must be deterministic — and
+equality-faithful.** No `HashMap` or `HashSet` in a generator's serde
+representation: their iteration order is unspecified, so two runs would encode
+one term two ways, producing two addresses and two rows for one term. Debug
+builds round-trip every encoding and assert the bytes reproduce, which catches
+this at the first write. Equality-faithful is the subtler half: values the
+consumer considers equal must serialize to equal bytes, and floats are the
+standing hazard — `-0.0` and `0.0` compare equal but encode differently (two
+addresses for one morphism), and a `NaN` color fails to encode with an error
+that never names the float. Prefer integral color representations, or
+canonicalize floats before they reach serde.
 
 Two limits follow from the encoding. `PropExpr` serializes externally tagged, so
 each nesting level costs two JSON containers against `serde_json`'s 128-container

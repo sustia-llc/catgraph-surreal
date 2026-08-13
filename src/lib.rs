@@ -60,10 +60,15 @@
 //!   has not been re-checked, and trusting it is how a corrupt document becomes
 //!   a panic deep inside an interpreter. Loading revalidates; see
 //!   [`RevalidationStage`].
-//! - **Keys are caller-supplied and stable.** The store indexes key strings and
-//!   enforces uniqueness where asked, but deriving them — and guaranteeing their
-//!   stability — stays with the caller. Standard-library hash output in
-//!   particular is not stable across processes and must never be persisted.
+//! - **Keys are caller-supplied where the store cannot derive them — and
+//!   store-derived where it can.** The term tier derives its own record ids
+//!   (a term's id *is* the digest of its canonical encoding; [`TermAddr`] is
+//!   never accepted from outside). The tiers where identity genuinely lives
+//!   with the consumer — document ids, weight keys, canonical cospan keys —
+//!   take caller-supplied stable strings, and there deriving them and
+//!   guaranteeing their stability stays with the caller. Standard-library hash
+//!   output in particular is not stable across processes and must never be
+//!   persisted.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]

@@ -79,15 +79,20 @@ fn identity() -> ColoredExpr<Gen> {
     ColoredExpr::new(vec![()], Free::<Gen>::identity(1)).expect("id₁ type-checks at one wire")
 }
 
-async fn bootstrapped(database: &str) -> (Store, TermStore<Gen>) {
-    let store = StoreBuilder::new("memory")
+async fn connect(database: &str) -> Store {
+    StoreBuilder::new("memory")
         .namespace("catgraph_test")
         .database(database)
         .connect()
         .await
-        .expect("connecting to the in-memory engine");
-    let terms = TermStore::new(store.clone());
-    terms.bootstrap().await.expect("bootstrapping the schema");
+        .expect("connecting to the in-memory engine")
+}
+
+async fn bootstrapped(database: &str) -> (Store, TermStore<Gen>) {
+    let store = connect(database).await;
+    let terms = TermStore::open(store.clone())
+        .await
+        .expect("opening the term store bootstraps and verifies");
     (store, terms)
 }
 
@@ -323,23 +328,119 @@ async fn an_unexpected_column_is_detected() {
     assert!(detail.contains("provenance"), "{detail}");
 }
 
-/// A table that was never defined reports an empty column set, which lands as
-/// drift rather than as an opaque table-not-found.
+/// A table that was never defined reports no definition, which lands as drift
+/// rather than as an opaque table-not-found. Checked through the free function
+/// on purpose: a `TermStore` value cannot exist without a verified schema.
 #[tokio::test]
 async fn an_undefined_table_is_detected_as_drift() {
-    let store = StoreBuilder::new("memory")
-        .namespace("catgraph_test")
-        .database("no_bootstrap")
-        .connect()
+    let store = connect("no_bootstrap").await;
+    let err = schema::assert_term_schema(store.client())
         .await
-        .expect("connecting to the in-memory engine");
-    let terms: TermStore<Gen> = TermStore::new(store);
+        .expect_err("nothing has been defined");
+    assert!(matches!(err, StoreError::Schema { .. }), "{err:?}");
+}
+
+/// The auto-create hole, closed and pinned. A raw write against an undefined
+/// table makes the engine create it `TYPE ANY SCHEMALESS`; a later bootstrap's
+/// `DEFINE TABLE IF NOT EXISTS` then blesses the impostor and every field gets
+/// defined on top of it. The definition-level guard is what refuses to serve
+/// it — and therefore [`TermStore::open`] must fail on such a database.
+#[tokio::test]
+async fn an_implicitly_created_table_is_refused_at_open() {
+    let store = connect("implicit_table").await;
+    store
+        .client()
+        .query("CREATE term:sneak SET smuggled = true")
+        .await
+        .expect("the raw write runs")
+        .check()
+        .expect("the engine auto-creates the table");
+
+    let err = TermStore::<Gen>::open(store)
+        .await
+        .expect_err("an implicitly created table must not verify");
+    let StoreError::Schema { detail, .. } = &err else {
+        panic!("expected schema drift, got {err:?}");
+    };
+    assert!(detail.contains("SCHEMALESS"), "{detail}");
+}
+
+/// The guard compares definitions, not names: `ALTER TABLE … SCHEMALESS` keeps
+/// all nine fields defined and every name in place while disarming the schema
+/// entirely. A name-level check passed this; the definition check must not.
+#[tokio::test]
+async fn a_schemaless_alteration_is_detected_as_drift() {
+    let (store, terms) = bootstrapped("altered_schemaless").await;
+    store
+        .client()
+        .query("ALTER TABLE term SCHEMALESS")
+        .await
+        .expect("the alteration runs")
+        .check()
+        .expect("the alteration succeeds");
 
     let err = terms
         .assert_schema()
         .await
-        .expect_err("nothing has been defined");
-    assert!(matches!(err, StoreError::Schema { .. }), "{err:?}");
+        .expect_err("a schemaless term table is drift");
+    let StoreError::Schema { detail, .. } = &err else {
+        panic!("expected schema drift, got {err:?}");
+    };
+    assert!(detail.contains("SCHEMALESS"), "{detail}");
+}
+
+/// Same class of blindness, field-level: re-defining a column without
+/// `READONLY` keeps its name while disarming the collision alarm.
+#[tokio::test]
+async fn a_disarmed_readonly_clause_is_detected_as_drift() {
+    let (store, terms) = bootstrapped("disarmed_readonly").await;
+    store
+        .client()
+        .query("DEFINE FIELD OVERWRITE term_json ON term TYPE string")
+        .await
+        .expect("the redefinition runs")
+        .check()
+        .expect("the redefinition succeeds");
+
+    let err = terms
+        .assert_schema()
+        .await
+        .expect_err("a field without READONLY is drift");
+    let StoreError::Schema { detail, .. } = &err else {
+        panic!("expected schema drift, got {err:?}");
+    };
+    assert!(detail.contains("term_json"), "{detail}");
+}
+
+/// A table that vanishes after open answers "absent", identically from both
+/// read methods — the same condition must not read as `false` from one and as
+/// an opaque query error from the other.
+#[tokio::test]
+async fn a_vanished_table_reads_as_absent_from_both_read_methods() {
+    let (store, terms) = bootstrapped("vanished_table").await;
+    let addr = terms.put(&copy_then_add()).await.expect("storing a term");
+
+    store
+        .client()
+        .query("REMOVE TABLE term")
+        .await
+        .expect("the removal runs")
+        .check()
+        .expect("the removal succeeds");
+
+    assert_eq!(
+        terms
+            .get(&addr)
+            .await
+            .expect("get absorbs the vanished table"),
+        None
+    );
+    assert!(
+        !terms
+            .contains(&addr)
+            .await
+            .expect("contains absorbs the vanished table")
+    );
 }
 
 // ------------------------------------------------------- corrupt documents
@@ -376,6 +477,19 @@ fn good_row() -> RawRow {
         generator_count: record.generator_count(),
         nf_class: record.nf_class().to_owned(),
     }
+}
+
+/// Re-file a (possibly tampered) row under its own encoding's digest.
+///
+/// Revalidation verifies the content address *first* — cheapest check, fully
+/// decides byte-tampering — so a fixture that swaps `term_json` while keeping
+/// the old id never reaches the stage it means to exercise. Re-filing makes the
+/// address check pass so the later stage fires; the un-re-filed case has its
+/// own test (`a_row_filed_under_the_wrong_address_is_rejected`).
+fn refile(mut row: RawRow) -> RawRow {
+    let digest = blake3::hash(row.term_json.as_bytes()).to_hex().to_string();
+    row.id = RecordId::new(schema::TERM_TABLE, format!("b3_{digest}"));
+    row
 }
 
 /// Write a row straight through the connection, bypassing the store.
@@ -472,6 +586,7 @@ async fn a_row_whose_bucket_does_not_match_the_encoding_is_rejected() {
 async fn a_row_whose_encoding_is_not_json_is_rejected() {
     let mut row = good_row();
     row.term_json = "{not json".to_owned();
+    let row = refile(row);
     match load_raw("corrupt_malformed", row).await {
         Err(StoreError::Codec(_)) => {}
         other => panic!("expected a codec failure, got {other:?}"),
@@ -484,6 +599,7 @@ async fn a_row_whose_encoding_is_not_json_is_rejected() {
 async fn a_row_whose_encoding_nests_past_the_parser_limit_is_rejected() {
     let mut row = good_row();
     row.term_json = format!("{}{}", "[".repeat(400), "]".repeat(400));
+    let row = refile(row);
     match load_raw("corrupt_over_deep", row).await {
         Err(StoreError::Codec(_)) => {}
         other => panic!("expected a codec failure, got {other:?}"),
@@ -518,6 +634,7 @@ async fn a_row_encoding_an_ill_composed_term_is_rejected() {
         "expr": { "Compose": [ { "Generator": "Copy" }, { "Generator": "Discard" } ] }
     })
     .to_string();
+    let row = refile(row);
     expect_revalidation(
         load_raw("corrupt_ill_composed", row).await,
         RevalidationStage::Arity,
@@ -537,6 +654,7 @@ async fn a_row_whose_source_word_does_not_fit_its_expression_is_rejected() {
     })
     .to_string();
     row.depth = 1;
+    let row = refile(row);
     expect_revalidation(
         load_raw("corrupt_word_fit", row).await,
         RevalidationStage::Check,

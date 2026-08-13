@@ -22,7 +22,7 @@
 //! queried and indexed, and every one of them is re-derived and compared on
 //! load — so a hand-edited column is caught rather than believed.
 //!
-//! # The `G` contract: `Serialize` must be deterministic
+//! # The `G` contract: `Serialize` must be deterministic — and equality-faithful
 //!
 //! Content addresses are only stable if a generator serializes to the same bytes
 //! every time. In practice that means **no `HashMap` or `HashSet` in a
@@ -30,10 +30,20 @@
 //! two runs would produce two encodings of the same term, two addresses, and two
 //! stored records for one genome.
 //!
-//! [`encode`] cannot check this in general, but it can catch it: in debug builds
-//! it round-trips its own output (encode → decode → re-encode) and asserts the
-//! bytes reproduce. A failure there means the consumer's `G` serde is
-//! non-deterministic; it is not a bug in this crate.
+//! The subtler half of the contract: **values the consumer considers equal must
+//! serialize to equal bytes**. Floating-point colors are the standing hazard —
+//! `-0.0` and `0.0` compare equal but encode as different JSON, so the "same"
+//! morphism built through two arithmetic paths gets two addresses and two
+//! `nf_class` buckets; a `NaN` color fails to encode at all, with a generic
+//! [`Codec`](crate::StoreError::Codec) error that never names the float. Prefer
+//! integral or otherwise canonical color and generator representations; if a
+//! float must appear, canonicalize it (`-0.0 → 0.0`, no `NaN`) before it
+//! reaches serde.
+//!
+//! [`encode`] cannot check this in general, but it can catch the deterministic
+//! half: in debug builds it round-trips its own output (encode → decode →
+//! re-encode) and asserts the bytes reproduce. A failure there means the
+//! consumer's `G` serde is non-deterministic; it is not a bug in this crate.
 //!
 //! # The JSON recursion cap is the effective depth limit
 //!
@@ -60,7 +70,7 @@
 use catgraph_applied::prop::colored::ColoredExpr;
 use catgraph_applied::prop::presentation::Presentation;
 use catgraph_applied::prop::presentation::content::is_arity_well_formed;
-use catgraph_applied::prop::presentation::smc_nf::{from_string_diagram, nf};
+use catgraph_applied::prop::presentation::smc_nf::{Atom, nf};
 use catgraph_applied::prop::{PropExpr, PropSignature};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -75,16 +85,25 @@ use crate::error::{Result, RevalidationStage, StoreError};
 /// this build does not recognise is refused on load rather than interpreted
 /// under the current rules, which is the difference between a loud upgrade and a
 /// silent misreading.
-pub const TERM_CODEC: &str = "cgj1";
+///
+/// `cgj2` (pre-release, no `cgj1` data ever left a test process): `nf_class`
+/// hashes the normalized diagram's **layer structure directly** rather than the
+/// re-associated expression — see [`nf_class`] for why the older derivation
+/// aborted the process on wide terms.
+pub const TERM_CODEC: &str = "cgj2";
 
 /// The maximum structural nesting depth a stored term may have.
 ///
 /// Mirrors `catgraph-syntax`'s `MAX_TERM_DEPTH`, which is the limit its
 /// interpreters enforce and the limit its parser produces. This crate does not
-/// depend on `catgraph-syntax` — it persists terms rather than interpreting them
-/// — so the constant and the walk below are reimplemented here. **They must
-/// track upstream**: a store that accepted deeper terms than the interpreters do
-/// would be handing its consumers documents they cannot use.
+/// depend on `catgraph-syntax` at run time — it persists terms rather than
+/// interpreting them — so the constant and the walk below are reimplemented
+/// here. **They must track upstream**: a store that accepted deeper terms than
+/// the interpreters do would be handing its consumers documents they cannot
+/// use. The mirror is *enforced*, not hoped for: `catgraph-syntax` is a
+/// dev-dependency, and a test asserts this constant and [`term_depth`] agree
+/// with the upstream originals — an upstream change fails CI here rather than
+/// silently diverging.
 ///
 /// In practice the JSON parser's own limit bites first (see the [module
 /// documentation](self)); this is the structural backstop, not the effective
@@ -170,10 +189,26 @@ where
 /// # Why the boundary words are folded in
 ///
 /// The class covers the source and target words as well as the normalized
-/// expression. Without them the soundness claim would not hold for colored
+/// diagram. Without them the soundness claim would not hold for colored
 /// terms: two expressions can share an underlying `PropExpr` while typing at
 /// different words, and those are different morphisms. Folding the words in
 /// keeps "equal class implies equal morphism" true rather than nearly true.
+///
+/// # Why the diagram is hashed directly
+///
+/// The hash input is the normalized diagram's **layer structure**, walked
+/// flatly — never the diagram folded back into an expression. The fold
+/// (`from_string_diagram`) right-associates the normal form into a chain whose
+/// nesting equals the generator count, and both `serde_json`'s recursive
+/// `Serialize` and the chain's own recursive drop glue then abort the process
+/// on wide terms — a depth screen bounds nesting, not width, so a term of a few
+/// thousand *parallel* generators sails through every guard and dies here. The
+/// layer walk nests a fixed handful of JSON containers no matter how wide the
+/// diagram is, and it keys the same equivalence: the fold is a deterministic
+/// function of the diagram, so equal diagrams and equal folds coincide.
+///
+/// The atom tags (`I`/`B`/`G`) are part of the encoding [`TERM_CODEC`]
+/// versions.
 ///
 /// # Errors
 ///
@@ -191,12 +226,33 @@ where
     if !is_arity_well_formed(term.expr()) {
         return Err(arity_failure());
     }
-    // `from_string_diagram` folds the normalized diagram back into a
-    // right-associated expression — the inverse of the lowering construction
-    // within symmetric monoidal coherence, and deterministic, which is what
-    // makes it hashable at all.
-    let normalized = from_string_diagram(&nf(term.expr()));
-    let canonical = serde_json::to_string(&(term.source_word(), term.target_word(), &normalized))?;
+
+    /// One atom of the canonical hash input. Borrowing and shallow: a
+    /// diagram of any width serializes at constant nesting depth.
+    #[derive(Serialize)]
+    enum AtomRepr<'a, S> {
+        I(usize),
+        B(usize, usize),
+        G(&'a S),
+    }
+
+    let diagram = nf(term.expr());
+    let layers: Vec<Vec<AtomRepr<'_, G>>> = diagram
+        .layers
+        .iter()
+        .map(|layer| {
+            layer
+                .atoms
+                .iter()
+                .map(|atom| match atom {
+                    Atom::Identity(width) => AtomRepr::I(*width),
+                    Atom::Braid(m, n) => AtomRepr::B(*m, *n),
+                    Atom::Generator(generator) => AtomRepr::G(generator),
+                })
+                .collect()
+        })
+        .collect();
+    let canonical = serde_json::to_string(&(term.source_word(), term.target_word(), &layers))?;
     Ok(digest(canonical.as_bytes()))
 }
 
@@ -307,7 +363,16 @@ impl TermRecord {
     /// Re-derive everything from `term_json` and hand back a term that has
     /// actually been checked.
     ///
-    /// # The four steps, and why the order is fixed
+    /// # The order, and why it is fixed
+    ///
+    /// **Before anything interprets the document, the content address is
+    /// verified**: `term_json` is re-digested and compared against the record
+    /// id it was filed under. It needs only the raw bytes, it is the cheapest
+    /// check here, and it fully decides byte-tampering — running it first means
+    /// a swapped-in encoding is rejected at hash-of-bytes cost instead of after
+    /// the whole pipeline below has run on hostile input.
+    ///
+    /// Then the four interpretation steps:
     ///
     /// 1. **Parse.** `serde_json` refuses over-deep nesting before anything else
     ///    gets a chance to look at the document, so its own recursion limit is
@@ -321,9 +386,6 @@ impl TermRecord {
     ///    check and re-derives the target word, then compare the derived
     ///    signature against the stored one — and the remaining derived columns
     ///    with it.
-    ///
-    /// The content address is verified too: `term_json` is re-digested and
-    /// compared against the record id it was filed under.
     ///
     /// # Cost
     ///
@@ -354,6 +416,16 @@ impl TermRecord {
                 field: "codec".to_owned(),
                 expected: TERM_CODEC.to_owned(),
                 actual: self.codec.clone(),
+            });
+        }
+
+        // The record id is the content address; verify it before interpreting a
+        // single byte. Cheapest check, fully decides tampering.
+        let addr = address_of(&self.term_json)?;
+        if addr != self.addr {
+            return Err(StoreError::Corrupt {
+                context: format!("{}:{}", crate::schema::TERM_TABLE, self.addr),
+                detail: format!("content address of the stored encoding is `{addr}`"),
             });
         }
 
@@ -428,16 +500,6 @@ impl TermRecord {
                     "stored nf_class `{}` disagrees with the derived `{derived}`",
                     self.nf_class
                 ),
-            });
-        }
-
-        // The record id is the content address, so a mismatch means the row is
-        // filed under something that is not its own encoding's digest.
-        let addr = address_of(&self.term_json)?;
-        if addr != self.addr {
-            return Err(StoreError::Corrupt {
-                context: format!("{}:{}", crate::schema::TERM_TABLE, self.addr),
-                detail: format!("content address of the stored encoding is `{addr}`"),
             });
         }
 
@@ -856,6 +918,71 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    /// A balanced tensor tree of `width` parallel `Discard` generators:
+    /// structural depth ~log₂(width), but as wide as asked.
+    fn wide_discards(width: usize) -> ColoredExpr<Gen> {
+        assert!(width >= 1);
+        let mut nodes: Vec<PropExpr<Gen>> =
+            (0..width).map(|_| Free::generator(Gen::Discard)).collect();
+        while nodes.len() > 1 {
+            nodes = nodes
+                .chunks(2)
+                .map(|pair| match pair {
+                    [only] => only.clone(),
+                    [left, right] => Free::tensor(left.clone(), right.clone()),
+                    _ => unreachable!("chunks(2) yields one or two"),
+                })
+                .collect();
+        }
+        let expr = nodes.pop().expect("invariant: width >= 1 leaves one root");
+        ColoredExpr::new(vec![(); width], expr).expect("parallel discards type-check")
+    }
+
+    /// Regression for the wide-term process abort: `nf_class` used to fold the
+    /// normalized diagram back into a right-associated expression whose nesting
+    /// equals the generator count, and serializing (or even dropping) that
+    /// chain blew the stack — SIGABRT, not an error. The depth screens bound
+    /// nesting, never width, so this term passes every guard. Run on a
+    /// deliberately small stack so the regression cannot hide behind a roomy
+    /// main thread.
+    #[test]
+    fn a_wide_term_encodes_and_revalidates_without_exhausting_the_stack() {
+        std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(|| {
+                let wide = wide_discards(2048);
+                let record = encode(&wide).expect("a wide, shallow term encodes");
+                let loaded: ColoredExpr<Gen> = record.revalidate().expect("and revalidates");
+                assert_eq!(loaded, wide);
+            })
+            .expect("invariant: spawning a test thread succeeds")
+            .join()
+            .expect("the wide-term thread must not abort or panic");
+    }
+
+    /// The depth limit and walk are mirrors of `catgraph-syntax`'s originals,
+    /// and this is the enforcement: an upstream change fails here instead of
+    /// silently diverging. The walk is compared on shapes that exercise every
+    /// arm — leaf, deep chain, wide tensor, braid.
+    #[test]
+    fn depth_limit_and_walk_track_catgraph_syntax() {
+        assert_eq!(MAX_TERM_DEPTH, catgraph_syntax::depth::MAX_TERM_DEPTH);
+        let samples: Vec<PropExpr<Gen>> = vec![
+            Free::identity(1),
+            Free::braid(2, 3),
+            deep_chain(37),
+            wide_discards(64).into_inner().2,
+            Free::tensor(deep_chain(5), Free::generator(Gen::Zero)),
+        ];
+        for expr in &samples {
+            assert_eq!(
+                term_depth(expr),
+                catgraph_syntax::depth::term_depth(expr),
+                "depth walks disagree on {expr:?}"
+            );
+        }
     }
 
     #[test]

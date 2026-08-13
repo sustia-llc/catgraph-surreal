@@ -12,13 +12,27 @@
 //!
 //! [`TermStore::get`] revalidates every document it loads, always. That is not
 //! defensiveness for its own sake: `ColoredExpr`'s `Deserialize` does not re-run
-//! the type check, database-side guards are void under `OPTION IMPORT` and never
-//! evaluated at all on a default embedded connection, and the arity screen is
-//! what stands between a hand-edited document and an abort deep inside the
-//! content pass. A "fast path" that skipped it would be a path that trusts
-//! whatever is on disk.
+//! the type check, database-side guards are all void under `OPTION IMPORT`
+//! (and the `PERMISSIONS` layer specifically is never evaluated on a default
+//! embedded connection — though `ASSERT` and `READONLY` *do* run there, and the
+//! collision alarm below relies on that), and the arity screen is what stands
+//! between a hand-edited document and an abort deep inside the content pass. A
+//! "fast path" that skipped it would be a path that trusts whatever is on disk.
+//!
+//! # A store value implies a verified schema
+//!
+//! There is no constructor that skips the schema: [`TermStore::open`]
+//! bootstraps and verifies before handing back a value. That is not ceremony —
+//! a write against an undefined table would make SurrealDB auto-create it
+//! `SCHEMALESS`, and a *later* bootstrap's `DEFINE TABLE IF NOT EXISTS` would
+//! then bless the impostor rather than replace it, permanently disarming every
+//! database-side guard while every documented signal stays green. Making the
+//! unbootstrapped store unrepresentable closes that hole at the type level;
+//! the definition-level drift guard closes it against tables created by
+//! someone else.
 
 use std::marker::PhantomData;
+use std::sync::LazyLock;
 
 use catgraph_applied::prop::PropSignature;
 use catgraph_applied::prop::colored::ColoredExpr;
@@ -60,9 +74,12 @@ const PUT_MANY: &str = "FOR $row IN $rows { UPSERT $row.id CONTENT $row RETURN N
 ///
 /// The projection is explicit rather than `SELECT *` so that a column this build
 /// expects and the database does not is a failure rather than a silently absent
-/// field.
-const GET: &str = "SELECT id, codec, term_json, signature, source_arity, target_arity, depth, \
-                   generator_count, nf_class FROM $rid";
+/// field — and it is **derived** from [`schema::TERM_FIELDS`] rather than
+/// written out, so the projection and the schema cannot drift apart. (A
+/// hand-written copy once had a pin test that passed vacuously: it looked for
+/// the substring `"id"`, which `"$rid"` also contains.)
+static GET: LazyLock<String> =
+    LazyLock::new(|| format!("SELECT {} FROM $rid", schema::TERM_FIELDS.join(", ")));
 
 /// Existence, without materialising the row.
 const EXISTS: &str = "RETURN record::exists($rid)";
@@ -135,6 +152,16 @@ fn record_id(addr: &TermAddr) -> RecordId {
     RecordId::new(TERM_TABLE, addr.as_str())
 }
 
+/// Whether an error is the engine reporting that the term table is undefined.
+///
+/// Message-keyed by necessity (the raise carries no structured discriminator),
+/// scoped to this table's exact rendering, and pinned by an integration test —
+/// the same discipline as the shutdown classifier.
+fn is_missing_term_table(e: &surrealdb::Error) -> bool {
+    e.message()
+        .contains(&format!("The table '{TERM_TABLE}' does not exist"))
+}
+
 /// Stores and loads terms, addressed by the digest of their canonical encoding.
 ///
 /// The generator type is a phantom parameter behind a function pointer, so the
@@ -146,17 +173,28 @@ pub struct TermStore<G> {
 }
 
 impl<G> TermStore<G> {
-    /// Wrap a connection.
+    /// Open the term repository: bootstrap the schema, verify it against what
+    /// this build declares, and only then hand back a value that can read or
+    /// write.
     ///
-    /// Call [`Self::bootstrap`] before the first write: the schema is not
-    /// created implicitly, and the existence checks below assume the table has
-    /// been defined.
-    #[must_use]
-    pub fn new(store: Store) -> Self {
-        Self {
+    /// This is the only constructor, deliberately — see the [module
+    /// documentation](self): a write before the schema exists would auto-create
+    /// a `SCHEMALESS` table that every later signal blesses. If the table
+    /// already exists, its definitions are verified exactly, so a table created
+    /// by an implicit write (or an older or newer version of this store) fails
+    /// here with [`StoreError::Schema`] rather than silently serving
+    /// unguarded rows.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the schema cannot be defined or does not verify.
+    pub async fn open(store: Store) -> Result<Self> {
+        let repository = Self {
             store,
             generator: PhantomData,
-        }
+        };
+        repository.bootstrap().await?;
+        Ok(repository)
     }
 
     /// The connection this store reads and writes through.
@@ -203,13 +241,14 @@ impl<G> TermStore<G> {
     /// on exactly one case: a table that does not exist. `SELECT` raises
     /// `TbNotFound`; `record::exists()` absorbs it into `false`.
     ///
-    /// `false` is the right answer here. This store defines its schema first —
-    /// [`Self::bootstrap`] is not optional, and [`Self::assert_schema`] is the
-    /// dedicated, *loud* detector for a table that has gone missing. Routing
-    /// that same condition through every existence check as an opaque
-    /// table-not-found error would make a bootstrap bug look like a query bug,
-    /// while telling `contains` callers nothing they can act on: an absent table
-    /// really does contain no terms.
+    /// `false` is the right answer here. This store defines its schema at
+    /// [`Self::open`], and [`Self::assert_schema`] is the dedicated, *loud*
+    /// detector for a table that has gone missing since. Routing that same
+    /// condition through every existence check as an opaque table-not-found
+    /// error would make a bootstrap bug look like a query bug, while telling
+    /// `contains` callers nothing they can act on: an absent table really does
+    /// contain no terms. [`Self::get`] absorbs the same condition into `None`
+    /// for the same reason — the two answers agree.
     ///
     /// # Errors
     ///
@@ -300,10 +339,19 @@ where
     pub async fn get(&self, addr: &TermAddr) -> Result<Option<ColoredExpr<G>>> {
         let mut response = self
             .client()
-            .query(GET)
+            .query(GET.as_str())
             .bind(("rid", record_id(addr)))
             .await?;
-        let row: Option<TermRow> = response.take(0)?;
+        // A vanished table answers `None`, matching `contains` — the same
+        // condition must not read as `false` from one method and as an opaque
+        // query error from the other. `SELECT` raises where `record::exists`
+        // absorbs, and the raise has no structured discriminator, so this is a
+        // message match; the integration suite pins it against the engine.
+        let row: Option<TermRow> = match response.take(0) {
+            Ok(row) => row,
+            Err(e) if is_missing_term_table(&e) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
         let Some(row) = row else {
             return Ok(None);
         };
@@ -316,18 +364,16 @@ where
 mod tests {
     use super::*;
 
-    /// The read projection and the declared schema are two statements of the
-    /// same column list. A column added to one and not the other would produce
-    /// either a row missing a field or a query naming a column that does not
-    /// exist — both at run time, against a real engine.
+    /// The read projection is derived from the declared schema, so this pins
+    /// the *whole* rendered statement — not per-field substring checks, whose
+    /// previous incarnation passed vacuously (`"$rid"` contains `"id"`).
     #[test]
-    fn the_read_projection_names_every_declared_column() {
-        for field in schema::TERM_FIELDS {
-            assert!(
-                GET.contains(field),
-                "`{field}` is declared but not projected on read"
-            );
-        }
+    fn the_read_projection_is_exactly_the_declared_column_list() {
+        assert_eq!(
+            GET.as_str(),
+            "SELECT id, term_json, codec, signature, source_arity, target_arity, \
+             depth, generator_count, nf_class FROM $rid"
+        );
     }
 
     /// Batch values ride as a bound parameter. If this ever regresses into
