@@ -56,7 +56,7 @@ use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 use crate::addr::CospanAddr;
 use crate::codec::LabelCodec;
 use crate::cospan::{self, CospanRecord};
-use crate::error::{self, Result, StoreError};
+use crate::error::{self, Refusals, Result, StoreError};
 use crate::schema::{self, COSPAN_CANON_INDEX, COSPAN_TABLE};
 use crate::store::Store;
 
@@ -341,8 +341,7 @@ impl<L: LabelCodec> CospanStore<L> {
                 COSPAN_TABLE,
                 statement,
                 binding,
-                Some(COSPAN_CANON_INDEX),
-                &[],
+                Refusals::none().with_unique_index(COSPAN_CANON_INDEX),
             )
             .await
     }

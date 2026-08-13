@@ -4,8 +4,10 @@ use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::SurrealValue;
 
+use std::time::Duration;
+
 use crate::capability::{self, Requirements};
-use crate::error::{self, Result, StoreError};
+use crate::error::{self, Refusals, Result, StoreError};
 
 /// Configure and open a [`Store`].
 ///
@@ -19,6 +21,7 @@ pub struct StoreBuilder {
     namespace: String,
     database: String,
     requirements: Requirements,
+    changefeed_gc_interval: Option<Duration>,
 }
 
 impl StoreBuilder {
@@ -30,6 +33,7 @@ impl StoreBuilder {
             namespace: "catgraph".to_owned(),
             database: "main".to_owned(),
             requirements: Requirements::none(),
+            changefeed_gc_interval: None,
         }
     }
 
@@ -61,6 +65,20 @@ impl StoreBuilder {
         self
     }
 
+    /// How often the engine collects expired change-capture entries.
+    ///
+    /// Only meaningful for the local engines, which run collection as a
+    /// background task. Leaving it unset takes the engine's own default, which
+    /// is what a deployment normally wants; setting it short is how a test makes
+    /// retention expiry observable within the test's own lifetime, since a
+    /// consumer cannot tell an expired cursor from an idle one until collection
+    /// has actually run.
+    #[must_use]
+    pub fn changefeed_gc_interval(mut self, interval: Duration) -> Self {
+        self.changefeed_gc_interval = Some(interval);
+        self
+    }
+
     /// Check capabilities, connect, and select the namespace and database.
     ///
     /// Capabilities are checked **first**, before any connection is opened, so a
@@ -76,7 +94,9 @@ impl StoreBuilder {
     pub async fn connect(self) -> Result<Store> {
         capability::check(&self.endpoint, self.requirements)?;
 
-        let client = surrealdb::engine::any::connect(&self.endpoint).await?;
+        let config =
+            surrealdb::opt::Config::new().changefeed_gc_interval(self.changefeed_gc_interval);
+        let client = surrealdb::engine::any::connect((self.endpoint.clone(), config)).await?;
         client
             .use_ns(&self.namespace)
             .use_db(&self.database)
@@ -151,8 +171,10 @@ impl Store {
     ///   surfaces it as [`StoreError::Schema`]: re-open the store.
     /// - **Refusal classification in the one safe order** — see
     ///   [`error::classify_write`]: unique-index collisions are recognised
-    ///   before `READONLY` refusals, because the collision message echoes
-    ///   caller-supplied values that can imitate the readonly rendering.
+    ///   before write-once events and `READONLY` refusals, because the collision
+    ///   message echoes caller-supplied values that can imitate either of the
+    ///   other two renderings. Which refusals a tier can produce is declared
+    ///   once, as [`Refusals`], beside its schema.
     ///
     /// The composed query text embeds only crate-owned constants (the table
     /// name and the statement); values ride as bound parameters.
@@ -161,9 +183,37 @@ impl Store {
         table: &'static str,
         statement: &str,
         binding: (&'static str, V),
-        unique_index: Option<&'static str>,
-        readonly_fields: &'static [&'static str],
+        refusals: Refusals,
     ) -> Result<()> {
+        self.run_write_response(table, statement, binding, refusals)
+            .await
+            .map(|_| ())
+    }
+
+    /// The slot the first of a write's own statements lands in.
+    ///
+    /// The guard wraps the statement as `BEGIN; IF …; <statement>; COMMIT;`, and
+    /// **`BEGIN` and `COMMIT` each occupy a result slot** — verified against the
+    /// engine, and the reason this is a named constant rather than an
+    /// open-coded `0`. A multi-statement write's `k`-th statement is therefore at
+    /// `FIRST_STATEMENT_SLOT + k`.
+    pub(crate) const FIRST_STATEMENT_SLOT: usize = 2;
+
+    /// [`Self::run_write`], keeping the response so a write can return a value
+    /// the database computed.
+    ///
+    /// Sequence allocation needs this: the number a publish is assigned is
+    /// decided inside the guarded transaction, and reading it back afterwards
+    /// would be both a second round trip and a different number under
+    /// concurrency. Callers index the response with
+    /// [`Self::FIRST_STATEMENT_SLOT`].
+    pub(crate) async fn run_write_response<V: SurrealValue + 'static>(
+        &self,
+        table: &'static str,
+        statement: &str,
+        binding: (&'static str, V),
+        refusals: Refusals,
+    ) -> Result<surrealdb::IndexedResults> {
         let guarded = format!(
             "BEGIN; \
              IF (INFO FOR DB).tables.{table} == NONE {{ THROW \"{sentinel}\" }}; \
@@ -180,7 +230,7 @@ impl Store {
         let mut errors: Vec<(usize, surrealdb::Error)> =
             response.take_errors().into_iter().collect();
         if errors.is_empty() {
-            return Ok(());
+            return Ok(response);
         }
         errors.sort_by_key(|(slot, _)| *slot);
 
@@ -196,8 +246,7 @@ impl Store {
             }
         }
         for (_, e) in &errors {
-            if let Some(classified) = error::classify_write(e, table, unique_index, readonly_fields)
-            {
+            if let Some(classified) = error::classify_write(e, table, refusals) {
                 return Err(classified);
             }
         }

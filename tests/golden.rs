@@ -22,8 +22,9 @@ use std::borrow::Cow;
 
 use catgraph::cospan::Cospan;
 use catgraph_applied::prop::colored::ColoredExpr;
+use catgraph_applied::prop::presentation::rewrite::{RewriteRule, optimize};
 use catgraph_applied::prop::{Free, PropSignature};
-use catgraph_surreal::{cospan, term, weight};
+use catgraph_surreal::{bus, cospan, doc, lineage, term, weight};
 use serde::{Deserialize, Serialize};
 
 /// The fixture signature: four unit variants, derived serde, one color.
@@ -100,5 +101,83 @@ fn weight_key_is_pinned_to_exact_bytes() {
     assert_eq!(
         key,
         "b3_aa84f12f952605d8d87eaa56b38e96ede8ce7d9f921282d50446b38d6b694d31"
+    );
+}
+
+/// `id₁ : 1 → 1` — the right-hand side of the fixture rule.
+fn fixture_identity() -> ColoredExpr<Gen> {
+    ColoredExpr::new(vec![()], Free::<Gen>::identity(1)).expect("id₁ type-checks")
+}
+
+/// `Δ ; μ ⇒ id₁` — the fixture rule set: parallel sides, a non-empty left-hand
+/// side, and a mono interface.
+fn fixture_rules() -> Vec<(ColoredExpr<Gen>, ColoredExpr<Gen>)> {
+    vec![(fixture_term(), fixture_identity())]
+}
+
+#[test]
+fn rule_set_identity_is_pinned_to_exact_bytes() {
+    let record = lineage::encode_rule_set(&fixture_rules()).expect("the fixture encodes");
+    assert_eq!(record.codec(), "cgs1");
+    assert_eq!(
+        record.addr().as_str(),
+        "b3_8ba60ef5b2b03b88c1953ec42c456b13c96fd806238aaaae27a5cc86a9098c14"
+    );
+}
+
+/// A run's address covers everything about it that is reproducible, so pinning
+/// it pins the whole column set — and the trace with it, since the steps are
+/// part of the pre-image.
+#[test]
+fn run_and_derivation_identity_are_pinned_to_exact_bytes() {
+    let rule_set = lineage::encode_rule_set(&fixture_rules()).expect("the fixture encodes");
+    let compiled: Vec<RewriteRule<Gen>> = rule_set.revalidate().expect("it revalidates");
+    let start = fixture_term();
+    let outcome = optimize(&start, &compiled, 16, |_| 1).expect("the search runs");
+
+    let run = lineage::encode_run(rule_set.addr(), &start, &outcome, "unit").expect("encodes");
+    assert_eq!(run.codec(), "cgt1");
+    assert_eq!(
+        run.addr().as_str(),
+        "b3_94386ff918a31a91c67ce4da92b73741edab0a2162928a30760ebe0b3ac082bc"
+    );
+
+    let edge = lineage::encode_derivation(&run).expect("the endpoints imply an edge");
+    assert_eq!(edge.codec(), "cge1");
+    assert_eq!(
+        edge.addr().as_str(),
+        "b3_e865c33e403edfcb16ad631479910ca237289d8498ca861bdf6f7192862eb9de"
+    );
+}
+
+#[test]
+fn document_digest_is_pinned_to_exact_bytes() {
+    let record = doc::encode(
+        "state-1",
+        "solver",
+        &serde_json::json!({ "beliefs": [0.25, 0.5, 0.25], "boundary": 7 }),
+    )
+    .expect("the fixture encodes");
+    assert_eq!(record.codec(), "cgd1");
+    assert_eq!(
+        record.digest(),
+        "b3_0ea375d42d7ab4468bbf9fd9b8058e3029632f2502cf800da5c04a94a770dde1"
+    );
+}
+
+#[test]
+fn bus_addresses_are_pinned_to_exact_bytes() {
+    assert_eq!(bus::BUS_CODEC, "cgb1");
+    assert_eq!(
+        bus::event_address("goals", 3).as_str(),
+        "b3_ed5f43239887a901a1bc676d11cdbbbb142446fb2e0e358d6ed8fb4900634424"
+    );
+    assert_eq!(
+        bus::allocator_key("goals"),
+        "b3_4809bd221996a318c60622010051244b744064a3ecb209902f57ee75ea6f1165"
+    );
+    assert_eq!(
+        bus::cursor_key("worker-1"),
+        "b3_1125adaa8b569a204ef86fe171e9dc6c3851ad8d5f91f0b102fac1efc30b5035"
     );
 }

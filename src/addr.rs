@@ -144,6 +144,46 @@ content_address! {
 }
 
 content_address! {
+    /// An opaque handle to a stored set of rewrite rules.
+    ///
+    /// The address is a content address of the rule set's canonical encoding, so
+    /// a rule pin — a rule-set address plus the equation indices and
+    /// orientations drawn from it — names an exact set of rules rather than
+    /// whatever a mutable "current rules" row happens to hold.
+    RuleSetAddr
+}
+
+content_address! {
+    /// An opaque handle to a stored optimizer trace.
+    ///
+    /// The address is a content address of everything about the run that is
+    /// reproducible: its rule set, its endpoints, its cost model, its costs, and
+    /// its steps. Recording the same run twice is therefore idempotent, and two
+    /// runs differing only in which weighting produced their numbers are
+    /// different records — which is the point of `cost_model` being mandatory.
+    RunAddr
+}
+
+content_address! {
+    /// An opaque handle to a stored derivation edge.
+    ///
+    /// The address is a content address of the tuple the edge *is* — parent,
+    /// child, and the run that derived one from the other — which is what makes
+    /// writing the edge idempotent without a second uniqueness mechanism.
+    DerivationAddr
+}
+
+content_address! {
+    /// An opaque handle to a stored bus event.
+    ///
+    /// The address is a content address of the `(stream, seq)` pair, so a
+    /// sequence number that was somehow handed out twice collides on the record
+    /// id and the second write is refused rather than silently overwriting the
+    /// first.
+    BusAddr
+}
+
+content_address! {
     /// An opaque handle to a stored cospan.
     ///
     /// The address is a content address of the cospan's *presentation* — its

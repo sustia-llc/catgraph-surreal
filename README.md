@@ -1,16 +1,24 @@
 # catgraph-surreal
 
 SurrealDB persistence for [catgraph](https://github.com/sustia-llc/catgraph)'s
-category-theoretic structures — terms, cospans, and parameter weights — embedded
-or over a server connection.
+category-theoretic structures — terms, cospans, parameter weights, rewrite
+lineage — plus a consumer-shaped document tier and a durable notification bus,
+embedded or over a server connection.
 
-> **Status: early.** The substrate is in place — the error type and its retry
-> classifiers, the label codec, the content-address newtypes, and a
-> capability-checked connection handle — and three repositories with it: the
-> content-addressed term store, the cospan store with its complete canonical
-> key, and the weight store on a bit-exact byte lane. Every one of them
-> revalidates what it loads. The lineage and document tiers and the notification
-> bus land next.
+> **Status: early, but complete in outline.** The substrate is in place — the
+> error type with its retry classifiers and the retry loop that implements them,
+> the label codec, the content-address newtypes, and a capability-checked
+> connection handle — and every tier is built on it. Each one revalidates what it
+> loads rather than trusting what came off disk.
+
+| Tier | What it stores |
+|---|---|
+| [Terms](#terms) | Content-addressed `ColoredExpr`s, revalidated on load |
+| [Cospans](#cospans) | Presentations, with a complete canonical key |
+| [Weights](#weights) | Coordinate vectors on a bit-exact byte lane |
+| [Lineage](#lineage) | Rule sets, optimizer traces, and the derivation graph |
+| [Documents](#documents) | Consumer-shaped serde types, mutable or write-once |
+| [Bus](#notification-bus) | Durable notifications with a live wakeup |
 
 ## Why this crate exists
 
@@ -170,6 +178,102 @@ supplies a new `gen_key`. Letting a key's value change underneath it would make
 every row referencing a `(genome, gen_key)` pair ambiguous about which vector it
 meant, which is the one property lineage and checkpoint data exist to have.
 
+## Lineage
+
+`LineageStore` keeps three things: the **rule sets** an optimizer ran under, the
+**traces** it produced, and the **derivation graph** those traces imply.
+
+A rule set is stored as the canonical JSON of its equation pairs, and loading
+rebuilds every rule through `RewriteRule::new` — which is where the four
+conditions a rewrite site relies on are actually checked. Serde checks none of
+them, so a rule that skipped the constructor would fail at a match site instead
+of at the boundary, or not fail at all and match where it should not have.
+
+A run records its endpoints, its costs, and its steps — for each step, which rule
+fired and on which hyperedges. **`cost_model` is a mandatory column**, because
+costs are sums of a per-generator weighting that arrives as a closure and cannot
+be persisted: two runs measured under different weightings produce numbers that
+look comparable and are not. A run that did not say which weighting produced its
+numbers has recorded numbers nobody can read.
+
+What the store cannot do yet is *replay* a trace. The step type has no public
+constructor and no serde representation at catgraph v0.11.0, so a stored step
+cannot become the value `replay` accepts. The steps persist today and are
+readable and comparable; re-deriving the endpoint from them needs an upstream
+surface that does not exist. The `replayable` column is where that lands — `false`
+on everything this build writes, and flippable without a schema migration.
+
+The `derives` edge is a `TYPE RELATION` table whose record id is the digest of
+the tuple it represents: parent, child, and the run that derived one from the
+other. That makes writing an edge idempotent without a second uniqueness
+mechanism, and it is written with `RELATE OR UPDATE` — the explicit form of what
+the engine does anyway, since a plain `RELATE` onto an existing edge id logs a
+warning and overwrites with nothing surfacing to the client.
+
+A run's trace and its edge are written in **one transaction**; the endpoint terms
+are written before it, outside, because content-addressed inserts are idempotent
+single statements two writers can race harmlessly.
+
+## Documents
+
+`DocStore<T>` and `ManifestStore<T>` store consumer-defined serde types the
+crate knows nothing about — a solver state, an archive entry, a registration
+manifest — without depending on the crate that defines them. What it still
+guarantees is that what comes back is what went in: a digest column is re-derived
+and compared before anything is deserialized.
+
+The payload column is `object FLEXIBLE`, which is what lets it hold a shape the
+schema does not describe. This is a **JSON lane**, with the limit that implies:
+a non-finite float becomes `null` on the way in, silently and irreversibly.
+Consumers needing bit-exact floats want the weight tier's byte lane instead.
+
+`ManifestStore` is the write-once half, and immutability is enforced four ways:
+no update or delete on the handle, `READONLY` on every column, a write-once
+`ASSERT` on every column whose type evaluates one, and synchronous refusal events
+on update and delete. On an embedded connection with no root user, permissions
+are never evaluated and `OPTION IMPORT;` disables the rest for a statement —
+**store-side immutability is the trust boundary; the database backs it up.** So a
+restore re-verifies digests rather than trusting the replay, which is what
+`verify_all()` is for.
+
+Registration is therefore create-only: re-registering an id is refused whatever
+the contents, with `ReadOnly` naming the column when they differ and `Immutable`
+naming the event when they are identical.
+
+## Notification bus
+
+`BusWriter` and `BusReader` are a durable bus with a live wakeup. Two tiers, one
+mechanism:
+
+- **Tier 1 — low volume, latency sensitive.** Subscribe for the wakeup, read the
+  durable rows when it fires.
+- **Tier 2 — high volume.** Poll `next_batch()` on an interval; do not subscribe.
+
+What is never correct is a live-only consumer. Notifications are best-effort and
+at-most-once, never replayed, with no gap detection and no structurally
+guaranteed ordering — so a listener that never reads rows loses events at every
+disconnect and under backpressure, quietly. **The row is the event; the
+notification says "look again".**
+
+Each stream numbers its events from zero, contiguously, from a per-stream counter
+allocated inside the same transaction that writes the event. That counter is also
+the write-skew fence: two publishers that only *read* it could both take the same
+number, but because both also write it they collide and one is refused as a
+retryable conflict.
+
+Catch-up reads the change feed from a persisted high-water mark and asserts
+contiguity, which turns the two ways a bus can go wrong into named errors:
+`BusGap` when a stream's numbers skip, and `BusStale` when the cursor is old
+enough that retention may already have discarded events — silently, since expiry
+signals nothing. Both have one remedy: `rebaseline()`, which adopts the durable
+rows and starts again. A restore needs it too, because an import emits no
+change-feed entries and no notifications at all.
+
+`subscribe()` hands the caller a `Stream` and this crate spawns nothing: the
+caller owns the loop, the cancellation, and ending the subscription — which is
+done by **dropping the stream**, since a raw `KILL` does not end one on an
+embedded engine.
+
 ## Engines
 
 Every engine sits behind a cargo feature; `default` is `rocksdb`.
@@ -224,22 +328,34 @@ classifiers:
 | Shutdown | `is_shutdown()` | Reconnect, then retry — **never persist as permanent** |
 | Everything else | neither | No blind retry |
 
-Two variants look retryable and are not, so they are worth naming: `Duplicate`
-(a unique index refusing a write — the equivalent record is already stored, and
-finding it is a read) and `ReadOnly` (a write-once column refusing a *changed*
-value). Both classify as neither conflict nor shutdown.
+`retry()` is the reference implementation of that table, and the shape it
+enforces is the point: the operation it takes must be the **whole** `begin()` …
+`commit()` unit, restartable from the top.
 
-Two subtleties are documented on the type itself, because getting either wrong
-loses data rather than merely erroring:
+Several variants look retryable and are not, so they are worth naming:
+`Duplicate` (a unique index refusing a write — the equivalent record is already
+stored, and finding it is a read), `ReadOnly` (a write-once column refusing a
+*changed* value), `Immutable` (a write-once event refusing an update or delete),
+and `BusGap` / `BusStale` (events lost, or a cursor that can no longer be
+trusted — both call for `rebaseline()`, not another attempt).
+
+Three subtleties are documented on the type itself, because getting any of them
+wrong loses data rather than merely erroring:
 
 - `is_conflict()` must be applied to the **whole** `begin()` … `commit()` unit,
   including the result of `commit()`. Some engines only detect conflicts at
   commit time, so a transaction whose statements all succeeded can still fail
   there.
-- Shutdown has **no structured discriminator**, and it surfaces in *different
-  error classes* depending on the path (the embedded commit slot reports it as a
-  query-class error; RPC-handler paths as connection-class) — so `is_shutdown()`
-  necessarily keys on message text alone, across classes.
+- The structured conflict discriminator **does not survive a client
+  transaction's `commit()`** — that path converts the failure with a plain
+  internal-error constructor and the kind is dropped. Since a client transaction
+  is exactly where the interesting conflicts happen, a classifier keyed on the
+  discriminator alone would classify almost none of them, so both shapes are
+  checked.
+- Shutdown has **no structured discriminator** at all, and it surfaces in
+  *different error classes* depending on the path (the embedded commit slot
+  reports it as a query-class error; RPC-handler paths as connection-class) — so
+  `is_shutdown()` necessarily keys on message text alone, across classes.
 
 ## MSRV
 

@@ -44,7 +44,7 @@ use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use surrealdb::types::{Bytes, RecordId, RecordIdKey, SurrealValue};
 
-use crate::error::{self, Result, StoreError};
+use crate::error::{self, Refusals, Result, StoreError};
 use crate::schema::{self, WEIGHT_FIELDS, WEIGHT_KEY_INDEX, WEIGHT_TABLE};
 use crate::store::Store;
 use crate::weight::{self, WeightRecord};
@@ -217,8 +217,9 @@ impl WeightStore {
                 WEIGHT_TABLE,
                 PUT,
                 ("row", WeightRow::from_record(record)),
-                Some(WEIGHT_KEY_INDEX),
-                &WEIGHT_FIELDS,
+                Refusals::none()
+                    .with_unique_index(WEIGHT_KEY_INDEX)
+                    .with_readonly_fields(&WEIGHT_FIELDS),
             )
             .await
     }

@@ -599,10 +599,12 @@ dependencies = [
  "catgraph-dl",
  "catgraph-syntax",
  "either",
+ "futures",
  "proptest",
  "serde",
  "serde_json",
  "surrealdb",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
 ]

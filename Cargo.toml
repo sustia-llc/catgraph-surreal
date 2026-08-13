@@ -76,6 +76,15 @@ serde_json = "1"
 # so this is on the write path of every stored term.
 blake3 = "1"
 
+# The retry helper's backoff, and nothing else — hence `time` alone. The SDK
+# already depends on tokio, so this adds no crate to the graph.
+#
+# Target-gated because there is no portable timer on wasm: the browser lane
+# retries without waiting (see `retry`), so pulling the dependency in there would
+# buy a feature that cannot run.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { version = "1", features = ["time"] }
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 # The corrupt-document fixtures re-file tampered encodings under their own
@@ -97,3 +106,11 @@ proptest = "1"
 # `Either` — which is the only way to exhibit the value this store's own
 # bounds check exists to refuse.
 either = "1"
+# The persistent engines lock their data directory, so every test that opens one
+# needs a directory of its own — sharing one would serialise the suite at best
+# and fail it at worst.
+tempfile = "3"
+# The live-query tier hands the caller a `Stream`; polling one in a test needs
+# the extension trait. The crate itself never polls it, which is the design —
+# the caller owns the loop.
+futures = "0.3"

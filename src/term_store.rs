@@ -43,7 +43,7 @@ use surrealdb::engine::any::Any;
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
 
 use crate::addr::TermAddr;
-use crate::error::{self, Result, StoreError};
+use crate::error::{self, Refusals, Result, StoreError};
 use crate::store::Store;
 use crate::term::{self, TermRecord};
 use crate::{schema, schema::TERM_TABLE};
@@ -89,8 +89,12 @@ const EXISTS: &str = "RETURN record::exists($rid)";
 /// Mirrors the schema exactly, integer columns included: the conversion between
 /// this and the in-memory counts happens once, in [`crate::term::encode`], where
 /// it is checked rather than cast.
+///
+/// Crate-visible because the lineage tier stores a run's endpoint terms itself,
+/// and it must write the same row shape this tier reads — two copies of the
+/// mapping would be two things to keep in step.
 #[derive(Debug, Clone, SurrealValue)]
-struct TermRow {
+pub(crate) struct TermRow {
     id: RecordId,
     codec: String,
     term_json: String,
@@ -105,7 +109,7 @@ struct TermRow {
 impl TermRow {
     /// Consuming on purpose: the encoding string moves into the row rather than
     /// being cloned per write.
-    fn from_record(record: TermRecord) -> Self {
+    pub(crate) fn from_record(record: TermRecord) -> Self {
         Self {
             id: record_id(&record.addr),
             codec: record.codec,
@@ -288,8 +292,7 @@ where
                 TERM_TABLE,
                 PUT,
                 ("row", TermRow::from_record(record)),
-                None,
-                &[],
+                Refusals::none(),
             )
             .await?;
         Ok(addr)
@@ -318,7 +321,7 @@ where
         let addrs: Vec<TermAddr> = records.iter().map(|r| r.addr().clone()).collect();
         let rows: Vec<TermRow> = records.into_iter().map(TermRow::from_record).collect();
         self.store
-            .run_write(TERM_TABLE, PUT_MANY, ("rows", rows), None, &[])
+            .run_write(TERM_TABLE, PUT_MANY, ("rows", rows), Refusals::none())
             .await?;
         Ok(addrs)
     }

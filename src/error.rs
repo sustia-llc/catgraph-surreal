@@ -20,6 +20,12 @@
 //! transaction whose every statement returned `Ok` can still fail at the commit
 //! slot. Classifying only the statement results silently drops that whole class.
 //!
+//! It also drops it in a second, less obvious way: the structured
+//! `TransactionConflict` discriminator **does not survive a client
+//! transaction's `commit()`**, only the query executor's own path. See
+//! [`StoreError::is_conflict`] for what that means and how both shapes are
+//! recognised.
+//!
 //! Engine conflict surfaces also differ, which matters when tuning backoff:
 //! the in-memory engine aborts on *read* conflicts too (so it aborts more often
 //! than plain snapshot isolation), RocksDB detects at commit, and SurrealKV
@@ -62,6 +68,24 @@ use thiserror::Error;
 /// CI green while silently killing the classifier. **Re-verify this constant
 /// against `surrealdb-core` on every SDK upgrade** (`rg "shutting down"`).
 const SHUTDOWN_MESSAGE: &str = "The datastore is shutting down";
+
+/// The prefix an engine puts on a transaction conflict.
+///
+/// Needed because the structured discriminator does **not** survive every path.
+/// A conflict raised by the query executor — `db.query("BEGIN; … COMMIT;")` —
+/// arrives carrying [`QueryError::TransactionConflict`]. A conflict raised by a
+/// *client* transaction's `commit()` does not: that path converts the failure
+/// with a plain internal-error constructor, and the kind is dropped on the way
+/// out. Since a client transaction is exactly where the interesting conflicts
+/// happen — RocksDB detects at commit time — a classifier keyed on the
+/// structured detail alone returns `false` for most real conflicts.
+///
+/// ⚠ Mirrored from upstream wording, like [`SHUTDOWN_MESSAGE`] — but unlike that
+/// one, this string is pinned by an integration test that provokes a **real**
+/// conflict on both embedded engines. A rewording fails CI rather than silently
+/// disabling every retry. **Re-verify on every SDK upgrade** all the same
+/// (`rg "Transaction conflict" surrealdb-core`).
+const CONFLICT_MESSAGE: &str = "Transaction conflict:";
 
 /// Which step of the revalidation-on-load discipline rejected a document.
 ///
@@ -222,10 +246,10 @@ pub enum StoreError {
 
     /// A write-once column was written with a *changed* value.
     ///
-    /// Every stored column in this crate is `READONLY`, so a record's contents
-    /// are fixed once written. Re-writing an identical value is a no-op and
-    /// raises nothing — only a change does, which is what makes this the alarm
-    /// rather than the noise.
+    /// Every stored column on a write-once table is `READONLY`, so a record's
+    /// contents are fixed once written. This clause compares *values*, so
+    /// re-writing an identical one raises nothing — only a change does, which is
+    /// what makes this the alarm rather than the noise.
     ///
     /// What it means depends on the tier, and the difference is worth keeping in
     /// view. For the weight tier it is *reachable by design*: a weight vector is
@@ -241,25 +265,69 @@ pub enum StoreError {
         field: String,
     },
 
-    /// A write-once record was targeted by an update or delete.
+    /// A write-once record was targeted by an update or delete, and a database
+    /// event refused it.
     ///
-    /// Store-side immutability is the primary guard; the database-side event is
-    /// defence in depth. How a rejecting event's error is detected and mapped
-    /// onto this variant is **decided when the write-once tables land**, pinned
-    /// there by tests against the real engine — nothing here prescribes
-    /// upstream message wording, deliberately (an untested transcription of
-    /// upstream text is exactly the fragility [`is_shutdown`](Self::is_shutdown)
-    /// has to manage, and this variant has no mitigation yet). One engine
-    /// property those tests must respect: a no-op write — one that sets a field
-    /// to the value it already holds — fires no event and raises no read-only
-    /// error at all, so immutability tests must write a *changed* value or they
-    /// pass vacuously.
+    /// Store-side immutability is the primary guard; the event is defence in
+    /// depth. It is detected from the engine's **wrapped** rendering, keyed on
+    /// the event's own name:
+    ///
+    /// ```text
+    /// Error while processing event <name>: An error occurred: <the thrown message>
+    /// ```
+    ///
+    /// Only the wrapper is upstream's; the thrown message is this crate's own
+    /// text ([`MANIFEST_IMMUTABLE_MESSAGE`](crate::schema::MANIFEST_IMMUTABLE_MESSAGE)),
+    /// and both halves are required to match. That is what keeps the classifier
+    /// from being a bare transcription of upstream wording, and an integration
+    /// test provokes a real refusal so a rewording fails CI rather than
+    /// silently disarming it.
+    ///
+    /// # Which refusal you actually get
+    ///
+    /// On the manifest table every column is also `READONLY`, and field
+    /// processing runs *before* events on the update path. So a write carrying a
+    /// **changed** value is refused as [`Self::ReadOnly`], naming the column;
+    /// this variant is what arrives when no column changed and the event is the
+    /// only layer left to object — a delete (which processes no fields at all)
+    /// or a re-write of an identical document. The sync `THROW` rolls the
+    /// transaction back either way, so the record stays as it was.
+    ///
+    /// One engine property is worth knowing exactly, because the obvious guess
+    /// is wrong: whether a no-op write counts as a modification **depends on the
+    /// data clause**. `UPDATE … SET x = <the value it already holds>` is not a
+    /// modification and fires nothing; `UPSERT … CONTENT <the document it
+    /// already holds>` is one, and fires. `READONLY` is unaffected either way —
+    /// it compares values, so an unchanged value never trips it.
     #[error("`{table}` is write-once; `{event}` rejected the write")]
     Immutable {
         /// The write-once table.
         table: String,
         /// The database event that rejected the write.
         event: String,
+    },
+
+    /// A bus consumer's cursor is old enough that change capture may already
+    /// have discarded events it has not seen.
+    ///
+    /// Change-capture retention is garbage-collected silently: a cursor that
+    /// falls outside the window receives whatever survives, with nothing
+    /// distinguishing "no new events" from "the events are gone". A consumer
+    /// therefore records *when* it last advanced, and catching up refuses to
+    /// trust a cursor whose age has come within reach of the window.
+    ///
+    /// Unlike [`Self::BusGap`] this is a *prediction*, raised before anything is
+    /// read, so no sequence numbers accompany it. The remedy is the same one:
+    /// re-baseline from the durable rows, which are the source of truth.
+    #[error(
+        "notification bus cursor is {age_secs}s old against a {retention_secs}s change-capture \
+         window; re-baseline from the durable rows"
+    )]
+    BusStale {
+        /// How long ago the cursor last advanced, in seconds.
+        age_secs: u64,
+        /// The change-capture retention it is measured against, in seconds.
+        retention_secs: u64,
     },
 }
 
@@ -270,10 +338,30 @@ impl StoreError {
     /// Apply this to the **whole** `begin()` … `commit()` unit — including the
     /// result of `commit()`. Some engines only detect conflicts at commit time,
     /// so a transaction whose statements all succeeded can still fail here.
+    ///
+    /// # Two shapes, one condition
+    ///
+    /// A conflict does **not** always carry a structured discriminator, and the
+    /// path where it does not is the common one:
+    ///
+    /// - The **query executor** propagates conflicts unwrapped, so a
+    ///   `db.query("BEGIN; … COMMIT;")` failure arrives as a query-class error
+    ///   whose details are [`QueryError::TransactionConflict`].
+    /// - A **client transaction**'s `commit()` converts the failure with a plain
+    ///   internal-error constructor, which discards the kind. All that survives
+    ///   is the message.
+    ///
+    /// Both are checked. Restricting to the structured detail would classify
+    /// almost no real conflicts, because a client transaction is where they
+    /// happen — RocksDB detects at commit time, so its conflicts arrive by the
+    /// second route exclusively.
     #[must_use]
     pub fn is_conflict(&self) -> bool {
         match self {
-            Self::Db(e) => matches!(e.query_details(), Some(QueryError::TransactionConflict)),
+            Self::Db(e) => {
+                matches!(e.query_details(), Some(QueryError::TransactionConflict))
+                    || e.message().contains(CONFLICT_MESSAGE)
+            }
             _ => false,
         }
     }
@@ -331,6 +419,33 @@ pub(crate) fn is_undefined_table_guard(e: &surrealdb::Error, table: &str) -> boo
     e.message().contains(&undefined_table_sentinel(table))
 }
 
+/// The sentinel a bus publish throws when the sequence number it prepared for is
+/// no longer the one the stream would hand out.
+///
+/// A publish has to know its sequence number *before* the transaction runs,
+/// because the event's record id is derived from it — so the transaction
+/// re-reads the allocator and refuses to proceed if the two disagree. Without
+/// that check a publisher whose read was overtaken between the read and the
+/// transaction would file an event under one number carrying another, and the
+/// mismatch would only surface much later, as a corrupt row.
+///
+/// Also crate-owned text, for the same reason as the table guard: this is the
+/// store detecting its own condition, not transcribing upstream's.
+/// It carries no apostrophe and no semicolon, deliberately: it is formatted into
+/// query text, where a quote would make the surrounding statement unreadable at
+/// best and a semicolon would look like a statement boundary that is not one.
+pub(crate) const STALE_SEQUENCE_SENTINEL: &str = "catgraph-surreal: the next sequence number for this stream moved, so the prepared publish \
+     is stale";
+
+/// Whether an error is a publish reporting that its prepared sequence number
+/// went stale.
+pub(crate) fn is_stale_sequence(error: &StoreError) -> bool {
+    match error {
+        StoreError::Db(e) => e.message().contains(STALE_SEQUENCE_SENTINEL),
+        _ => false,
+    }
+}
+
 /// Whether an error is a unique index on `table` refusing a write.
 ///
 /// Also message-keyed, and also pinned by an integration test that provokes a
@@ -362,6 +477,75 @@ pub(crate) fn read_only_field(e: &surrealdb::Error, fields: &[&str]) -> Option<S
         .map(|field| (*field).to_owned())
 }
 
+/// Whether an error is a write-once event refusing a write, and if so which
+/// event.
+///
+/// Keyed on **both** halves of the rendering: upstream's wrapper, which names
+/// the event, and this crate's own thrown message. Requiring the crate-owned
+/// half is what separates this from a bare transcription of upstream text — a
+/// foreign event that happened to fire on the same table cannot satisfy it, and
+/// neither can a message echoing caller-supplied values. Pinned by an
+/// integration test that provokes a real refusal.
+pub(crate) fn immutable_event(e: &surrealdb::Error, events: &[&str]) -> Option<String> {
+    let message = e.message();
+    if !message.contains(crate::schema::MANIFEST_IMMUTABLE_MESSAGE) {
+        return None;
+    }
+    events
+        .iter()
+        .find(|event| message.contains(&format!("Error while processing event {event}:")))
+        .map(|event| (*event).to_owned())
+}
+
+/// What a table's write may be refused with, beyond a plain database error.
+///
+/// Passed to the guarded executor so a tier declares its refusal surfaces once,
+/// beside its schema, rather than re-deriving them at each call site.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Refusals {
+    /// The unique index whose collisions become [`StoreError::Duplicate`].
+    pub unique_index: Option<&'static str>,
+    /// The `READONLY` columns whose refusals become [`StoreError::ReadOnly`].
+    pub readonly_fields: &'static [&'static str],
+    /// The write-once events whose refusals become [`StoreError::Immutable`].
+    pub events: &'static [&'static str],
+}
+
+impl Refusals {
+    /// A tier that classifies nothing: every refusal surfaces as the raw
+    /// database error it is.
+    ///
+    /// The right choice where a classified refusal would be *unreachable* rather
+    /// than merely unhandled — on a content-addressed table a read-only refusal
+    /// would mean two distinct encodings produced one address, which deserves
+    /// the raw error rather than a variant implying a routine outcome.
+    pub(crate) const fn none() -> Self {
+        Self {
+            unique_index: None,
+            readonly_fields: &[],
+            events: &[],
+        }
+    }
+
+    /// Also classify collisions on `index`.
+    pub(crate) const fn with_unique_index(mut self, index: &'static str) -> Self {
+        self.unique_index = Some(index);
+        self
+    }
+
+    /// Also classify `READONLY` refusals naming one of `fields`.
+    pub(crate) const fn with_readonly_fields(mut self, fields: &'static [&'static str]) -> Self {
+        self.readonly_fields = fields;
+        self
+    }
+
+    /// Also classify refusals thrown by one of `events`.
+    pub(crate) const fn with_events(mut self, events: &'static [&'static str]) -> Self {
+        self.events = events;
+        self
+    }
+}
+
 /// Translate a refused write into a typed error, in the one safe order.
 ///
 /// **Duplicate is tested first, deliberately.** The unique-index refusal echoes
@@ -371,13 +555,18 @@ pub(crate) fn read_only_field(e: &surrealdb::Error, fields: &[&str]) -> Option<S
 /// would file the data under a fabricated identity while a foreign row keeps
 /// the real one. The readonly rendering echoes no values, so this order cannot
 /// misroute in the other direction.
+///
+/// The event refusal is tested next. Its rendering is half crate-owned text, so
+/// it cannot be reached by an echoed value either, and testing it before
+/// `ReadOnly` keeps the two orders from mattering: on a delete only the event
+/// can fire, and on an update field processing runs first, so a write never
+/// produces both.
 pub(crate) fn classify_write(
     e: &surrealdb::Error,
     table: &str,
-    unique_index: Option<&str>,
-    readonly_fields: &[&str],
+    refusals: Refusals,
 ) -> Option<StoreError> {
-    if let Some(index) = unique_index
+    if let Some(index) = refusals.unique_index
         && is_duplicate(e, index)
     {
         return Some(StoreError::Duplicate {
@@ -385,7 +574,13 @@ pub(crate) fn classify_write(
             index: index.to_owned(),
         });
     }
-    if let Some(field) = read_only_field(e, readonly_fields) {
+    if let Some(event) = immutable_event(e, refusals.events) {
+        return Some(StoreError::Immutable {
+            table: table.to_owned(),
+            event,
+        });
+    }
+    if let Some(field) = read_only_field(e, refusals.readonly_fields) {
         return Some(StoreError::ReadOnly {
             table: table.to_owned(),
             field,
@@ -440,6 +635,45 @@ mod tests {
             None,
         ));
         assert!(!err.is_conflict());
+    }
+
+    /// The shape a *client* transaction's `commit()` actually produces: the
+    /// structured kind is discarded on that path, so only the message is left.
+    /// A classifier keyed on the discriminator alone returns `false` for exactly
+    /// the conflicts a store meets in practice.
+    #[test]
+    fn conflict_is_classified_from_the_client_transaction_commit_shape() {
+        let err = StoreError::Db(surrealdb::Error::internal(
+            "Transaction conflict: Write conflict, retry the transaction. This transaction can \
+             be retried"
+                .to_owned(),
+        ));
+        assert!(err.query_details_are_absent());
+        assert!(err.is_conflict());
+        assert!(!err.is_shutdown());
+    }
+
+    /// The load-bearing negative: an ordinary internal error must not be swept
+    /// into the retry loop by the message check.
+    #[test]
+    fn an_ordinary_internal_error_is_not_a_conflict() {
+        let err = StoreError::Db(surrealdb::Error::internal(
+            "something went wrong".to_owned(),
+        ));
+        assert!(!err.is_conflict());
+        assert!(!err.is_shutdown());
+    }
+
+    impl StoreError {
+        /// Test helper: assert the structured discriminator really is absent, so
+        /// the case above is testing the message path rather than accidentally
+        /// passing through the structured one.
+        fn query_details_are_absent(&self) -> bool {
+            match self {
+                Self::Db(e) => e.query_details().is_none(),
+                _ => true,
+            }
+        }
     }
 
     /// Shutdown's RPC-handler shape: a connection-class error whose message
@@ -520,6 +754,10 @@ mod tests {
                 table: "weight".to_owned(),
                 field: "coordinates".to_owned(),
             },
+            StoreError::BusStale {
+                age_secs: 90,
+                retention_secs: 100,
+            },
         ];
         for err in cases {
             assert!(!err.is_conflict(), "{err} must not classify as a conflict");
@@ -584,6 +822,89 @@ mod tests {
         // than none.
         assert_eq!(read_only_field(&read_only, &["dim", "finite"]), None);
         assert_eq!(read_only_field(&missing, &["coordinates"]), None);
+    }
+
+    /// The write-once classifier needs *both* halves: upstream's wrapper naming
+    /// the event, and this crate's own thrown message. Either alone is a
+    /// coincidence, and treating a coincidence as immutability would report a
+    /// refusal that never happened.
+    #[test]
+    fn the_write_once_classifier_needs_the_wrapper_and_the_crate_owned_message() {
+        let refusal = surrealdb::Error::query(
+            format!(
+                "Error while processing event manifest_no_delete: An error occurred: {}",
+                crate::schema::MANIFEST_IMMUTABLE_MESSAGE
+            ),
+            None,
+        );
+        assert_eq!(
+            immutable_event(&refusal, &["manifest_no_update", "manifest_no_delete"]).as_deref(),
+            Some("manifest_no_delete")
+        );
+        // An event this caller does not own must not be claimed as one of its
+        // own — the classifier reports which event, and a wrong answer is worse
+        // than none.
+        assert_eq!(immutable_event(&refusal, &["manifest_no_update"]), None);
+
+        // Upstream's wrapper alone: some other event on the same table failed
+        // for some other reason, which is not immutability.
+        let foreign = surrealdb::Error::query(
+            "Error while processing event manifest_no_delete: An error occurred: something else"
+                .to_owned(),
+            None,
+        );
+        assert_eq!(immutable_event(&foreign, &["manifest_no_delete"]), None);
+
+        // The crate-owned message alone, echoed by some other failure: no event
+        // refused anything.
+        let echoed = surrealdb::Error::query(
+            format!(
+                "Database index `x` already contains '{}'",
+                crate::schema::MANIFEST_IMMUTABLE_MESSAGE
+            ),
+            None,
+        );
+        assert_eq!(immutable_event(&echoed, &["manifest_no_delete"]), None);
+    }
+
+    /// The refusal order is the one safe order: a unique-index message echoes
+    /// caller-supplied values, so it is decided first, and neither of the other
+    /// two can be reached by an echoed value.
+    #[test]
+    fn refusal_classification_prefers_the_index_message_it_cannot_trust() {
+        let refusals = Refusals::none()
+            .with_unique_index("weight_key")
+            .with_readonly_fields(&["coordinates"])
+            .with_events(&["manifest_no_delete"]);
+
+        // A key that spells out a readonly refusal must still be classified as
+        // the collision it is.
+        let hostile = surrealdb::Error::query(
+            "Database index `weight_key` already contains 'Found changed value for field \
+             `coordinates`, with record `weight:x`, but field is readonly', with record \
+             `weight:y`"
+                .to_owned(),
+            None,
+        );
+        assert!(matches!(
+            classify_write(&hostile, "weight", refusals),
+            Some(StoreError::Duplicate { .. })
+        ));
+
+        let read_only = surrealdb::Error::query(
+            "Found changed value for field `coordinates`, with record `weight:x`, but field is \
+             readonly"
+                .to_owned(),
+            None,
+        );
+        assert!(matches!(
+            classify_write(&read_only, "weight", refusals),
+            Some(StoreError::ReadOnly { .. })
+        ));
+
+        let unrelated = surrealdb::Error::query("something else entirely".to_owned(), None);
+        assert!(classify_write(&unrelated, "weight", refusals).is_none());
+        assert!(classify_write(&read_only, "weight", Refusals::none()).is_none());
     }
 
     /// The catgraph bridge has to be a real `#[from]`, so `?` works across the

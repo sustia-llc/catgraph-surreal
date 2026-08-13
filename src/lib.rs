@@ -5,14 +5,21 @@
 //!
 //! # Status
 //!
-//! Early. The substrate is in place — the [error type](error) and its retry
-//! classifiers, the [label codec](codec) bridging catgraph's generic labels to
-//! their stored form, the [content-address newtypes](addr), and a
-//! [capability-checked](capability) [`Store`] handle — and three repositories
-//! with it: the content-addressed [term store](term_store), the
-//! [cospan store](cospan_store) with its complete canonical key, and the
-//! [weight store](weight_store) on a bit-exact byte lane. The lineage and
-//! document tiers and the notification bus land next.
+//! Early, but complete in outline. The substrate is in place — the
+//! [error type](error) with its retry classifiers and the [retry loop](mod@retry)
+//! that implements them, the [label codec](codec) bridging catgraph's generic
+//! labels to their stored form, the [content-address newtypes](addr), and a
+//! [capability-checked](capability) [`Store`] handle — and every tier is built
+//! on it:
+//!
+//! | Tier | What it stores |
+//! |---|---|
+//! | [terms](term_store) | Content-addressed `ColoredExpr`s, revalidated on load |
+//! | [cospans](cospan_store) | Presentations, with a complete canonical key |
+//! | [weights](weight_store) | Coordinate vectors on a bit-exact byte lane |
+//! | [lineage](lineage_store) | Rule sets, optimizer traces, and the derivation graph |
+//! | [documents](doc_store) | Consumer-shaped serde types, mutable or write-once |
+//! | [bus](bus_store) | Durable notifications with a live wakeup |
 //!
 //! ```no_run
 //! use catgraph_surreal::StoreBuilder;
@@ -81,11 +88,18 @@
 mod readme_doctests {}
 
 pub mod addr;
+pub mod bus;
+pub mod bus_store;
 pub mod capability;
 pub mod codec;
 pub mod cospan;
 pub mod cospan_store;
+pub mod doc;
+pub mod doc_store;
 pub mod error;
+pub mod lineage;
+pub mod lineage_store;
+pub mod retry;
 pub mod schema;
 pub mod store;
 pub mod term;
@@ -93,12 +107,19 @@ pub mod term_store;
 pub mod weight;
 pub mod weight_store;
 
-pub use addr::{CospanAddr, TermAddr};
+pub use addr::{BusAddr, CospanAddr, DerivationAddr, RuleSetAddr, RunAddr, TermAddr};
+pub use bus::BusEvent;
+pub use bus_store::{BusReader, BusStream, BusWriter};
 pub use capability::{Capability, EndpointCapabilities, Requirements};
 pub use codec::LabelCodec;
 pub use cospan::CospanRecord;
 pub use cospan_store::CospanStore;
+pub use doc::DocumentRecord;
+pub use doc_store::{DocStore, ManifestStore};
 pub use error::{Result, RevalidationStage, StoreError};
+pub use lineage::{DerivationRecord, RuleSetRecord, RunRecord, TraceStep};
+pub use lineage_store::LineageStore;
+pub use retry::{RetryPolicy, retry};
 pub use store::{Store, StoreBuilder};
 pub use term::TermRecord;
 pub use term_store::TermStore;
