@@ -62,7 +62,7 @@ use serde::de::DeserializeOwned;
 use crate::addr::{DerivationAddr, RuleSetAddr, RunAddr, TermAddr};
 use crate::error::{Result, RevalidationStage, StoreError};
 use crate::schema::{DERIVES_TABLE, REWRITE_RUN_TABLE, RULE_SET_TABLE};
-use crate::term::{self, MAX_TERM_DEPTH, term_depth};
+use crate::term::{self, MAX_TERM_DEPTH, TermRecord, term_depth};
 
 /// The version tag stored in every rule set's `codec` column.
 ///
@@ -76,7 +76,15 @@ pub const RULE_SET_CODEC: &str = "cgs1";
 pub const REWRITE_RUN_CODEC: &str = "cgt1";
 
 /// The version tag stored in every derivation edge's `codec` column.
-pub const DERIVATION_CODEC: &str = "cge1";
+///
+/// `cge2` (pre-release, no `cge1` data ever left a test process): the edge's
+/// content address now covers its denormalized `rule_set` and `cost_model`
+/// columns as well as `(parent, child, run)`. Under `cge1` those two were the
+/// only stored columns in the tier that revalidation could not re-derive, so a
+/// tampered or restored edge could misattribute a derivation to a weighting the
+/// run never used and still verify. Folding them into the digest closes that,
+/// at the cost of a new address for every edge — which is what the tag is for.
+pub const DERIVATION_CODEC: &str = "cge2";
 
 // ------------------------------------------------------------------ rule sets
 
@@ -506,6 +514,33 @@ where
     G: PropSignature + Serialize + DeserializeOwned,
     G::Color: Serialize + DeserializeOwned,
 {
+    encode_run_with_endpoints(rule_set, start, outcome, cost_model).map(|(run, _)| run)
+}
+
+/// [`encode_run`], keeping the endpoint terms it had to encode anyway.
+///
+/// A run's address covers its two endpoints, so both are encoded here whatever
+/// the caller does with them — and encoding a term is the expensive half of this
+/// call, since it derives a normal form before it digests anything. The
+/// repository then has to *store* those same two terms, so handing them back is
+/// the difference between encoding two terms and encoding four.
+///
+/// The endpoints are returned in the order they are stored: the run's start,
+/// then its best.
+///
+/// # Errors
+///
+/// As [`encode_run`].
+pub(crate) fn encode_run_with_endpoints<G>(
+    rule_set: &RuleSetAddr,
+    start: &ColoredExpr<G>,
+    outcome: &RewriteOutcome<G>,
+    cost_model: &str,
+) -> Result<(RunRecord, [TermRecord; 2])>
+where
+    G: PropSignature + Serialize + DeserializeOwned,
+    G::Color: Serialize + DeserializeOwned,
+{
     if cost_model.is_empty() {
         return Err(StoreError::Revalidation {
             stage: RevalidationStage::Check,
@@ -528,14 +563,16 @@ where
         })
         .collect::<Result<Vec<TraceStep>>>()?;
 
+    let endpoints = [term::encode(start)?, term::encode(outcome.best())?];
+
     let mut record = RunRecord {
         // Filled in below, once every other column is settled: the address is a
         // digest over them.
         addr: RunAddr::from_digest(&"0".repeat(64)).expect("invariant: 64 zeroes is a digest"),
         codec: REWRITE_RUN_CODEC.to_owned(),
         rule_set: rule_set.clone(),
-        start: term::encode(start)?.addr().clone(),
-        best: term::encode(outcome.best())?.addr().clone(),
+        start: endpoints[0].addr().clone(),
+        best: endpoints[1].addr().clone(),
         cost_model: cost_model.to_owned(),
         initial_cost: cost_column("initial_cost", outcome.initial_cost())?,
         best_cost: cost_column("best_cost", outcome.best_cost())?,
@@ -547,7 +584,7 @@ where
         replayable: false,
     };
     record.addr = run_address(&record)?;
-    Ok(record)
+    Ok((record, endpoints))
 }
 
 /// The content address of a run: a digest over every column that describes what
@@ -678,7 +715,13 @@ impl DerivationRecord {
                 actual: self.codec.clone(),
             });
         }
-        let addr = derivation_address(&self.parent, &self.child, &self.run)?;
+        let addr = derivation_address(
+            &self.parent,
+            &self.child,
+            &self.run,
+            &self.rule_set,
+            &self.cost_model,
+        )?;
         if addr != self.addr {
             return Err(StoreError::Corrupt {
                 context: format!("{DERIVES_TABLE}:{}", self.addr),
@@ -696,7 +739,13 @@ impl DerivationRecord {
 /// [`StoreError::Codec`] if the tuple does not encode.
 pub fn encode_derivation(run: &RunRecord) -> Result<DerivationRecord> {
     Ok(DerivationRecord {
-        addr: derivation_address(&run.start, &run.best, &run.addr)?,
+        addr: derivation_address(
+            &run.start,
+            &run.best,
+            &run.addr,
+            &run.rule_set,
+            &run.cost_model,
+        )?,
         codec: DERIVATION_CODEC.to_owned(),
         parent: run.start.clone(),
         child: run.best.clone(),
@@ -706,13 +755,24 @@ pub fn encode_derivation(run: &RunRecord) -> Result<DerivationRecord> {
     })
 }
 
-/// The content address of a derivation edge: a digest over the tuple it is.
+/// The content address of a derivation edge: a digest over **every** column it
+/// stores.
 ///
 /// This is what makes writing an edge idempotent without a second uniqueness
-/// mechanism. The same `(parent, child, run)` always lands on the same record
-/// id, so re-recording a run rewrites the same row with the same values — no
-/// change, no read-only refusal, no duplicate. A *different* payload under that
-/// id would be a changed value, which the `READONLY` columns refuse.
+/// mechanism. The same columns always land on the same record id, so
+/// re-recording a run rewrites the same row with the same values — no change, no
+/// read-only refusal, no duplicate. A *different* payload under that id would be
+/// a changed value, which the `READONLY` columns refuse.
+///
+/// `rule_set` and `cost_model` are in the pre-image even though both are
+/// *denormalized* copies of columns the run already carries, and that is the
+/// point: revalidation re-derives an address and compares it, so a column
+/// outside the pre-image is a column nothing checks. Under `cge1` those two were
+/// exactly that — the only stored values in the tier a tampered or restored edge
+/// could change while still verifying, which would attribute a derivation to a
+/// weighting the run never ran under. Reading them off the run instead was not
+/// an option: the edge is what a traversal reads, and following it to the run to
+/// find out what its numbers mean defeats storing them on it.
 ///
 /// The alternative — a generated edge id plus a unique index over the tuple —
 /// was not taken. It needs two mechanisms to say one thing, it puts a record-id
@@ -727,12 +787,16 @@ fn derivation_address(
     parent: &TermAddr,
     child: &TermAddr,
     run: &RunAddr,
+    rule_set: &RuleSetAddr,
+    cost_model: &str,
 ) -> Result<DerivationAddr> {
     let canonical = serde_json::to_string(&(
         DERIVATION_CODEC,
         parent.as_str(),
         child.as_str(),
         run.as_str(),
+        rule_set.as_str(),
+        cost_model,
     ))?;
     let digest = address(DERIVES_TABLE, &canonical);
     DerivationAddr::from_digest(&digest).ok_or_else(|| StoreError::Corrupt {
@@ -1125,6 +1189,77 @@ mod tests {
             .revalidate()
             .expect_err("an edge filed under another tuple's id is corrupt");
         assert!(matches!(err, StoreError::Corrupt { .. }), "{err}");
+    }
+
+    /// The denormalized columns are inside the pre-image, so a re-labelled edge
+    /// is corrupt rather than merely wrong.
+    ///
+    /// Under `cge1` `rule_set` and `cost_model` were the only stored values in
+    /// the whole tier that revalidation could not re-derive: an edge whose
+    /// weighting had been swapped — by a hand edit, or by a restore replaying a
+    /// doctored dump — verified cleanly while misattributing every derivation it
+    /// described to numbers measured under something else.
+    #[test]
+    fn an_edge_whose_denormalized_columns_were_swapped_is_corrupt() {
+        let (rule_set, start, outcome) = an_outcome();
+        let run = encode_run(rule_set.addr(), &start, &outcome, "unit").expect("encodes");
+        let edge = encode_derivation(&run).expect("encodes");
+
+        let relabelled = DerivationRecord::from_columns(
+            edge.addr().clone(),
+            edge.codec().to_owned(),
+            edge.parent().clone(),
+            edge.child().clone(),
+            edge.run().clone(),
+            edge.rule_set().clone(),
+            "weighted".to_owned(),
+        );
+        let err = relabelled
+            .revalidate()
+            .expect_err("a swapped weighting is corrupt");
+        assert!(matches!(err, StoreError::Corrupt { .. }), "{err}");
+
+        let repointed = DerivationRecord::from_columns(
+            edge.addr().clone(),
+            edge.codec().to_owned(),
+            edge.parent().clone(),
+            edge.child().clone(),
+            edge.run().clone(),
+            RuleSetAddr::from_digest(&"d".repeat(64)).expect("a valid digest"),
+            edge.cost_model().to_owned(),
+        );
+        let err = repointed
+            .revalidate()
+            .expect_err("a swapped rule set is corrupt");
+        assert!(matches!(err, StoreError::Corrupt { .. }), "{err}");
+    }
+
+    /// And the same fact stated positively, over the address function directly.
+    ///
+    /// Going through `encode_run` would prove less than it looks: two runs under
+    /// different weightings already have different *run* addresses, so their
+    /// edges would differ even under `cge1`. Holding `(parent, child, run)` fixed
+    /// and varying only a denormalized column is what isolates the widening.
+    #[test]
+    fn the_denormalized_columns_move_the_address_on_their_own() {
+        let (rule_set, start, outcome) = an_outcome();
+        let run = encode_run(rule_set.addr(), &start, &outcome, "unit").expect("encodes");
+        let edge = encode_derivation(&run).expect("encodes");
+        let at = |rules: &RuleSetAddr, cost_model: &str| {
+            derivation_address(edge.parent(), edge.child(), edge.run(), rules, cost_model)
+                .expect("a tuple is always addressable")
+        };
+
+        let base = at(edge.rule_set(), "unit");
+        assert_eq!(&base, edge.addr());
+        assert_ne!(base, at(edge.rule_set(), "weighted"));
+        assert_ne!(
+            base,
+            at(
+                &RuleSetAddr::from_digest(&"d".repeat(64)).expect("a valid digest"),
+                "unit"
+            )
+        );
     }
 
     /// Two tiers digesting identical bytes must not agree on an address.

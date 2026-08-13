@@ -767,8 +767,17 @@ pub const DERIVES_POINTERS: [&str; 2] = ["in", "out"];
 /// The index on the run an edge was recorded by.
 pub const DERIVES_RUN_INDEX: &str = "derives_run";
 
+/// The index on an edge's incoming pointer — the term it leads out of.
+///
+/// The forward traversal ("what did some run derive from this morphism?") is the
+/// whole reason the tier keeps a graph, and it filters on `in`. The planner
+/// resolves candidate rows only from *defined* indexes, so without this the
+/// traversal is a full scan of the edge table on every hop — which is fine at
+/// ten edges and is the tier's dominant cost at ten million.
+pub const DERIVES_IN_INDEX: &str = "derives_in";
+
 /// Every index the [`DERIVES_TABLE`] schema declares.
-pub const DERIVES_INDEXES: [&str; 1] = [DERIVES_RUN_INDEX];
+pub const DERIVES_INDEXES: [&str; 2] = [DERIVES_RUN_INDEX, DERIVES_IN_INDEX];
 
 /// The derives table's own definition, as the engine renders it.
 pub const DERIVES_TABLE_DEFINITION: &str =
@@ -818,10 +827,16 @@ pub const DERIVES_POINTER_DEFINITIONS: [(&str, &str); 2] = [
 ];
 
 /// Every declared index's definition, as the engine renders it.
-pub const DERIVES_INDEX_DEFINITIONS: [(&str, &str); 1] = [(
-    DERIVES_RUN_INDEX,
-    "DEFINE INDEX derives_run ON derives FIELDS run",
-)];
+pub const DERIVES_INDEX_DEFINITIONS: [(&str, &str); 2] = [
+    (
+        DERIVES_RUN_INDEX,
+        "DEFINE INDEX derives_run ON derives FIELDS run",
+    ),
+    (
+        DERIVES_IN_INDEX,
+        "DEFINE INDEX derives_in ON derives FIELDS in",
+    ),
+];
 
 /// The derives table's DDL.
 const DERIVES_DDL: &str = "\
@@ -835,6 +850,7 @@ DEFINE FIELD IF NOT EXISTS rule_set ON derives TYPE string READONLY;
 DEFINE FIELD IF NOT EXISTS cost_model ON derives TYPE string READONLY;
 
 DEFINE INDEX IF NOT EXISTS derives_run ON derives FIELDS run;
+DEFINE INDEX IF NOT EXISTS derives_in ON derives FIELDS in;
 ";
 
 /// The derives table's schema, as this build declares it.
@@ -1072,7 +1088,7 @@ pub const BUS_FIELDS: [&str; 5] = ["id", "codec", "stream", "seq", "payload"];
 pub const BUS_SEQ_FIELDS: [&str; 3] = ["id", "stream", "next_seq"];
 
 /// Every column the [`BUS_MARK_TABLE`] schema declares, in DDL order.
-pub const BUS_MARK_FIELDS: [&str; 4] = ["id", "consumer", "versionstamp", "stamped_at"];
+pub const BUS_MARK_FIELDS: [&str; 5] = ["id", "consumer", "versionstamp", "stamped_at", "seen"];
 
 /// The compound index on `(stream, seq)`.
 ///
@@ -1174,7 +1190,15 @@ pub const BUS_MARK_TABLE_DEFINITION: &str =
 /// — "is this cursor older than the change-capture window?" — can be asked in
 /// the database, where `time::now()` is, rather than by comparing a stored
 /// number against a clock the store would have to trust.
-pub const BUS_MARK_FIELD_DEFINITIONS: [(&str, &str); 4] = [
+///
+/// `seen` holds the consumer's per-stream sequence expectations, and it is an
+/// opaque JSON **string** for the same reason a term is: a native nested value
+/// would have to be declared, key by key, on a `SCHEMAFULL` table whose keys are
+/// stream names nobody can enumerate in a DDL. Held in memory alone the
+/// expectations reset at every reader restart, and a hole punched while a
+/// consumer was down would pass as a first sighting — which is exactly the
+/// silent loss the sequence numbers exist to catch.
+pub const BUS_MARK_FIELD_DEFINITIONS: [(&str, &str); 5] = [
     (
         "id",
         "DEFINE FIELD id ON bus_mark TYPE string ASSERT record::id($value) != '' PERMISSIONS FULL",
@@ -1190,6 +1214,10 @@ pub const BUS_MARK_FIELD_DEFINITIONS: [(&str, &str); 4] = [
     (
         "stamped_at",
         "DEFINE FIELD stamped_at ON bus_mark TYPE datetime PERMISSIONS FULL",
+    ),
+    (
+        "seen",
+        "DEFINE FIELD seen ON bus_mark TYPE string PERMISSIONS FULL",
     ),
 ];
 
@@ -1236,6 +1264,7 @@ DEFINE FIELD IF NOT EXISTS id ON bus_mark TYPE string
 DEFINE FIELD IF NOT EXISTS consumer ON bus_mark TYPE string;
 DEFINE FIELD IF NOT EXISTS versionstamp ON bus_mark TYPE int;
 DEFINE FIELD IF NOT EXISTS stamped_at ON bus_mark TYPE datetime;
+DEFINE FIELD IF NOT EXISTS seen ON bus_mark TYPE string;
 ";
 
 /// The bus table's schema for a given retention.
@@ -1282,48 +1311,15 @@ const BUS_MARK_SCHEMA: TableSchema = TableSchema {
 /// Render a duration the way SurrealQL does, so an expected table definition can
 /// be compared against the engine's own rendering.
 ///
-/// Mirrors the reduction the value layer performs — years, weeks, days, hours,
-/// minutes, seconds, then sub-second parts — rather than emitting a bare second
-/// count, because the engine normalises `3600s` to `1h` on the way out and an
-/// exact comparison would otherwise fail on a correctly bootstrapped database.
+/// The rendering is the SDK value type's, not this crate's: a duration reaches
+/// the engine's `INFO` output through exactly this formatter, which reduces
+/// `3600s` to `1h` and emits `µs` for microseconds, so a hand-rolled mirror
+/// would be a second implementation of a normalization the drift guard compares
+/// *exactly* against. There is no version of that mirror that is safer than
+/// calling the thing being mirrored — a divergence in either direction reports
+/// drift on a correctly bootstrapped database.
 fn render_duration(duration: Duration) -> String {
-    const SECS_PER_MINUTE: u64 = 60;
-    const SECS_PER_HOUR: u64 = 60 * SECS_PER_MINUTE;
-    const SECS_PER_DAY: u64 = 24 * SECS_PER_HOUR;
-    const SECS_PER_WEEK: u64 = 7 * SECS_PER_DAY;
-    const SECS_PER_YEAR: u64 = 365 * SECS_PER_DAY;
-
-    let mut secs = duration.as_secs();
-    let nanos = duration.subsec_nanos();
-    if secs == 0 && nanos == 0 {
-        return "0ns".to_owned();
-    }
-    let mut rendered = String::new();
-    for (unit, suffix) in [
-        (SECS_PER_YEAR, "y"),
-        (SECS_PER_WEEK, "w"),
-        (SECS_PER_DAY, "d"),
-        (SECS_PER_HOUR, "h"),
-        (SECS_PER_MINUTE, "m"),
-        (1, "s"),
-    ] {
-        let count = secs / unit;
-        secs %= unit;
-        if count > 0 {
-            rendered.push_str(&count.to_string());
-            rendered.push_str(suffix);
-        }
-    }
-    let millis = nanos / 1_000_000;
-    let micros = (nanos % 1_000_000) / 1_000;
-    let rest = nanos % 1_000;
-    for (count, suffix) in [(millis, "ms"), (micros, "\u{b5}s"), (rest, "ns")] {
-        if count > 0 {
-            rendered.push_str(&count.to_string());
-            rendered.push_str(suffix);
-        }
-    }
-    rendered
+    surrealdb::types::Duration::from(duration).to_string()
 }
 
 // -------------------------------------------------------------- the machinery
@@ -1772,6 +1768,15 @@ mod tests {
 
     /// Every load-bearing token the guard exists to protect must actually be in
     /// the expected definitions it compares against.
+    ///
+    /// **Nested fields are walked too, by their root column.** A nested
+    /// definition carries no `READONLY` of its own and is not supposed to:
+    /// writing `steps[0].rule` changes the value of the `steps` column, so the
+    /// *root* column's clause is what refuses it — the same relationship an
+    /// array element has to its parent. Chasing the chain rather than skipping
+    /// the field is what makes that a checked claim instead of an assumption;
+    /// for a top-level column the root is the column itself, so the two cases
+    /// are one rule.
     #[test]
     fn expected_definitions_carry_the_guards() {
         for schema in all_schemas() {
@@ -1780,13 +1785,25 @@ mod tests {
                 "{}",
                 schema.table
             );
-            for (name, definition) in schema.fields {
+            for (name, definition) in schema.fields.iter().chain(schema.nested_fields) {
                 if *name == "id" {
                     assert!(definition.contains("ASSERT record::id($value)"), "{name}");
                 } else if schema.write_once {
+                    let root = name
+                        .split('.')
+                        .next()
+                        .expect("invariant: splitting a name yields at least one part");
+                    let (_, root_definition) = schema
+                        .fields
+                        .iter()
+                        .find(|(field, _)| *field == root)
+                        .unwrap_or_else(|| {
+                            panic!("`{name}` has no declared root column on {}", schema.table)
+                        });
                     assert!(
-                        definition.contains("READONLY"),
-                        "`{}.{name}` is on a write-once table but is not READONLY",
+                        root_definition.contains("READONLY"),
+                        "`{}.{name}` is on a write-once table but its root column `{root}` is \
+                         not READONLY — nothing would refuse a write to it",
                         schema.table
                     );
                 }
@@ -1822,8 +1839,15 @@ mod tests {
         for schema in all_schemas() {
             let declared = schema.all_fields();
             for (name, definition) in schema.implicit_fields {
+                // Anchored to the whole `DEFINE FIELD` prefix rather than to
+                // `<name> ON <table>`: a pointer named `in` is a suffix of the
+                // index name `derives_in`, so the loose form reports the
+                // *index* statement as a dead field definition.
                 assert!(
-                    !schema.ddl.contains(&format!("{name} ON {}", schema.table)),
+                    !schema.ddl.contains(&format!(
+                        "DEFINE FIELD IF NOT EXISTS {name} ON {}",
+                        schema.table
+                    )),
                     "the {} DDL declares `{name}`, which the engine already created — \
                      the statement is dead text",
                     schema.table
@@ -2106,23 +2130,6 @@ mod tests {
         let with_extra = live(&[("a", "DEFINE a"), ("b", "DEFINE b"), ("c", "DEFINE c")]);
         assert!(compare_definitions("t", "column", &with_extra, &expected, true).is_err());
         assert!(compare_definitions("t", "index", &with_extra, &expected, false).is_ok());
-    }
-
-    /// The retention rendering has to match the engine's own normalization, or
-    /// the drift guard fails on a correctly bootstrapped bus table.
-    #[test]
-    fn durations_render_the_way_surrealql_normalises_them() {
-        assert_eq!(render_duration(Duration::from_secs(1)), "1s");
-        assert_eq!(render_duration(Duration::from_secs(60)), "1m");
-        assert_eq!(render_duration(Duration::from_secs(3600)), "1h");
-        assert_eq!(render_duration(Duration::from_secs(86_400)), "1d");
-        assert_eq!(render_duration(Duration::from_secs(7 * 86_400)), "1w");
-        assert_eq!(render_duration(Duration::from_secs(365 * 86_400)), "1y");
-        assert_eq!(render_duration(Duration::from_secs(90)), "1m30s");
-        assert_eq!(render_duration(Duration::from_millis(1500)), "1s500ms");
-        assert_eq!(render_duration(Duration::from_nanos(0)), "0ns");
-        assert_eq!(render_duration(Duration::from_nanos(1)), "1ns");
-        assert_eq!(render_duration(Duration::from_micros(1)), "1\u{b5}s");
     }
 
     /// The retention reaches both the DDL and the expected definition, so a

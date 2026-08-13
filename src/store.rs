@@ -163,7 +163,7 @@ impl Store {
     /// than by each repository re-copying them:
     ///
     /// - **The table-existence guard.** The statement runs inside a transaction
-    ///   that first checks the table is still *defined* and `THROW`s a
+    ///   that first checks the tables are still *defined* and `THROW`s a
     ///   crate-owned sentinel otherwise. A bare write against an undefined
     ///   table would not fail — the engine auto-creates the table
     ///   `TYPE ANY SCHEMALESS`, silently disarming every schema-level guard —
@@ -176,28 +176,47 @@ impl Store {
     ///   other two renderings. Which refusals a tier can produce is declared
     ///   once, as [`Refusals`], beside its schema.
     ///
+    /// # `tables` is every table the statement writes, not just the obvious one
+    ///
+    /// One `IF … THROW` is composed per named table, all inside the same
+    /// transaction. That is not defensive breadth: a statement that writes two
+    /// tables and guards one leaves the *other* wide open to exactly the
+    /// condition the guard exists to close — a publish also writes its sequence
+    /// allocator, a run also `RELATE`s its derivation edge, and `REMOVE TABLE`
+    /// on either of those would otherwise be silently repaired as a
+    /// `TYPE ANY SCHEMALESS` impostor on the next write. Every call site
+    /// declares the full set, and there is a per-statement integration test for
+    /// each one that names more than a single table.
+    ///
+    /// The first entry is the **primary** table: it is the one a classified
+    /// refusal is reported against, and the one whose [`Refusals`] were
+    /// declared. `tables` must not be empty.
+    ///
     /// The composed query text embeds only crate-owned constants (the table
-    /// name and the statement); values ride as bound parameters.
+    /// names and the statement); values ride as bound parameters.
     pub(crate) async fn run_write<V: SurrealValue + 'static>(
         &self,
-        table: &'static str,
+        tables: &'static [&'static str],
         statement: &str,
         binding: (&'static str, V),
         refusals: Refusals,
     ) -> Result<()> {
-        self.run_write_response(table, statement, binding, refusals)
+        self.run_write_response(tables, statement, binding, refusals)
             .await
             .map(|_| ())
     }
 
-    /// The slot the first of a write's own statements lands in.
+    /// The slot the first of a write's own statements lands in, for a write
+    /// guarding `tables` tables.
     ///
-    /// The guard wraps the statement as `BEGIN; IF …; <statement>; COMMIT;`, and
-    /// **`BEGIN` and `COMMIT` each occupy a result slot** — verified against the
-    /// engine, and the reason this is a named constant rather than an
-    /// open-coded `0`. A multi-statement write's `k`-th statement is therefore at
-    /// `FIRST_STATEMENT_SLOT + k`.
-    pub(crate) const FIRST_STATEMENT_SLOT: usize = 2;
+    /// The guard wraps the statement as `BEGIN; IF …; … ; <statement>; COMMIT;`
+    /// with one `IF` per guarded table, and **`BEGIN` and `COMMIT` each occupy a
+    /// result slot** — verified against the engine, and the reason this is a
+    /// named function rather than an open-coded `0`. A multi-statement write's
+    /// `k`-th statement is therefore at `first_statement_slot(n) + k`.
+    pub(crate) const fn first_statement_slot(tables: usize) -> usize {
+        1 + tables
+    }
 
     /// [`Self::run_write`], keeping the response so a write can return a value
     /// the database computed.
@@ -206,21 +225,29 @@ impl Store {
     /// decided inside the guarded transaction, and reading it back afterwards
     /// would be both a second round trip and a different number under
     /// concurrency. Callers index the response with
-    /// [`Self::FIRST_STATEMENT_SLOT`].
+    /// [`Self::first_statement_slot`].
     pub(crate) async fn run_write_response<V: SurrealValue + 'static>(
         &self,
-        table: &'static str,
+        tables: &'static [&'static str],
         statement: &str,
         binding: (&'static str, V),
         refusals: Refusals,
     ) -> Result<surrealdb::IndexedResults> {
-        let guarded = format!(
-            "BEGIN; \
-             IF (INFO FOR DB).tables.{table} == NONE {{ THROW \"{sentinel}\" }}; \
-             {statement}; \
-             COMMIT;",
-            sentinel = error::undefined_table_sentinel(table),
+        debug_assert!(
+            !tables.is_empty(),
+            "invariant: a guarded write names at least the table it writes"
         );
+        let guards: String = tables
+            .iter()
+            .map(|table| {
+                format!(
+                    "IF (INFO FOR DB).tables.{table} == NONE {{ THROW \"{sentinel}\" }}; ",
+                    sentinel = error::undefined_table_sentinel(table),
+                )
+            })
+            .collect();
+        let guarded = format!("BEGIN; {guards}{statement}; COMMIT;");
+        let primary = tables.first().copied().unwrap_or_default();
         let mut response = self.client.query(guarded).bind(binding).await?;
         // `check()` would surface the FIRST error slot — which, inside the
         // guard transaction, is the guard statement's "not executed due to a
@@ -235,18 +262,20 @@ impl Store {
         errors.sort_by_key(|(slot, _)| *slot);
 
         for (_, e) in &errors {
-            if error::is_undefined_table_guard(e, table) {
-                return Err(StoreError::Schema {
-                    table: table.to_owned(),
-                    detail: "the table is no longer defined — it was removed after this store \
-                             opened; writing would silently re-create it schemaless, so re-open \
-                             (bootstrap and verify) instead"
-                        .to_owned(),
-                });
+            for table in tables {
+                if error::is_undefined_table_guard(e, table) {
+                    return Err(StoreError::Schema {
+                        table: (*table).to_owned(),
+                        detail: "the table is no longer defined — it was removed after this store \
+                                 opened; writing would silently re-create it schemaless, so \
+                                 re-open (bootstrap and verify) instead"
+                            .to_owned(),
+                    });
+                }
             }
         }
         for (_, e) in &errors {
-            if let Some(classified) = error::classify_write(e, table, refusals) {
+            if let Some(classified) = error::classify_write(e, primary, refusals) {
                 return Err(classified);
             }
         }

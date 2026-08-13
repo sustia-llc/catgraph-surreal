@@ -10,10 +10,16 @@
 //! corrupt and re-writes of already-stored data quietly duplicate.
 //!
 //! These vectors are the tripwire. If one fails and the change was
-//! intentional, bump the affected codec tag (`TERM_CODEC` / `COSPAN_CODEC` /
-//! `WEIGHT_CODEC`) and re-pin the vector **in the same commit** — that is what
-//! the tags exist for. If the change was not intentional, a dependency just
-//! moved the on-disk format out from under the store.
+//! intentional, bump the affected codec tag (`TERM_CODEC`, `COSPAN_CODEC`,
+//! `WEIGHT_CODEC`, `RULE_SET_CODEC`, `REWRITE_RUN_CODEC`, `DERIVATION_CODEC`,
+//! `DOCUMENT_CODEC`, `BUS_CODEC`) and re-pin the vector **in the same commit** —
+//! that is what the tags exist for. If the change was not intentional, a
+//! dependency just moved the on-disk format out from under the store.
+//!
+//! The pre-image is not only the *encoding* but the choice of what goes into it,
+//! so widening an address is a codec bump too: `cge2` folded the derivation
+//! edge's denormalized `rule_set` and `cost_model` into its digest, which moved
+//! every edge address and was re-pinned here alongside the tag.
 //!
 //! Engine-free on purpose: identity must not depend on which engine feature is
 //! compiled in, and these run on every lane.
@@ -143,10 +149,10 @@ fn run_and_derivation_identity_are_pinned_to_exact_bytes() {
     );
 
     let edge = lineage::encode_derivation(&run).expect("the endpoints imply an edge");
-    assert_eq!(edge.codec(), "cge1");
+    assert_eq!(edge.codec(), "cge2");
     assert_eq!(
         edge.addr().as_str(),
-        "b3_e865c33e403edfcb16ad631479910ca237289d8498ca861bdf6f7192862eb9de"
+        "b3_7a57ab5622cd95676da7b20968ff27839ed569edec05e448dbd5ac582a9a8f93"
     );
 }
 

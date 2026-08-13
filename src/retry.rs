@@ -195,6 +195,16 @@ pub fn is_retryable(error: &StoreError) -> bool {
     error.is_conflict() || error.is_shutdown()
 }
 
+/// Wait out a computed backoff.
+///
+/// Crate-internal, and shared with the bus's publish loop: that loop re-prepares
+/// in-process after losing a sequence-number race and needs the same
+/// decorrelation this module's own loop does — two publishers that collided once
+/// otherwise come back for the counter together.
+pub(crate) async fn pause(delay: Duration) {
+    sleep(delay).await;
+}
+
 /// Wait, where waiting is possible.
 #[cfg(not(target_family = "wasm"))]
 async fn sleep(delay: Duration) {
@@ -377,5 +387,43 @@ mod tests {
         assert!(is_retryable(&conflict()));
         assert!(is_retryable(&shutdown()));
         assert!(!is_retryable(&permanent()));
+    }
+
+    /// A publish that used up its internal re-preparations is reporting
+    /// contention, and the loop has to treat it as such: its own documentation
+    /// tells the caller to retry, so a classifier that refused it would leave
+    /// the one failure the bus predicts outside every tier of the contract.
+    #[tokio::test]
+    async fn an_exhausted_publish_preparation_is_retried() {
+        let exhausted = || {
+            StoreError::Db(surrealdb::Error::query(
+                format!(
+                    "An error occurred: {}",
+                    crate::error::STALE_SEQUENCE_SENTINEL
+                ),
+                None,
+            ))
+        };
+        assert!(is_retryable(&exhausted()));
+
+        let policy = RetryPolicy::new()
+            .attempts(4)
+            .base_delay(Duration::from_micros(1));
+        let result = retry(policy, |attempt| async move {
+            if attempt < 2 {
+                Err(exhausted())
+            } else {
+                Ok(attempt)
+            }
+        })
+        .await;
+        assert_eq!(result.expect("the third attempt succeeds"), 2);
+    }
+
+    /// A no-op on wasm and a real wait elsewhere, but it must be callable from
+    /// both — the bus's publish loop is not target-gated.
+    #[tokio::test]
+    async fn the_shared_backoff_is_awaitable() {
+        pause(Duration::from_micros(1)).await;
     }
 }

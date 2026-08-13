@@ -142,6 +142,56 @@ async fn a_cursor_older_than_the_window_is_refused_rather_than_trusted() {
     assert_eq!(batch[0].seq(), 2);
 }
 
+/// **A healthy reader on a quiet bus must not age out of its own window.**
+///
+/// The prediction above is measured against `stamped_at`, and `stamped_at` is
+/// written by a cursor write. A reader that only wrote the cursor when the feed
+/// had *moved* therefore aged past the limit while doing everything right: poll,
+/// find nothing, poll again — and somewhere past three quarters of the window it
+/// would start reporting a stale cursor and keep reporting it, since the remedy
+/// (re-baselining) also skipped the write when the feed had not moved. The wedge
+/// was permanent, and its exit cost an event: the forced re-baseline stamps past
+/// whatever arrived first.
+///
+/// So a poll that drained the feed to its end renews the cursor whether or not
+/// the end moved. This polls a silent bus for longer than the limit and then
+/// checks that the first event afterwards is delivered rather than swallowed.
+#[tokio::test]
+async fn an_idle_reader_does_not_age_out_of_its_own_window() {
+    let (store, writer) = bus("changefeed_idle").await;
+    let mut reader = BusReader::with_retention(store.clone(), "worker-1", RETENTION)
+        .await
+        .expect("opening a reader");
+
+    writer
+        .publish("ticks", &Tick { generation: 0 })
+        .await
+        .expect("publishing");
+    assert_eq!(reader.next_batch().await.expect("catching up").len(), 1);
+
+    // Comfortably past three quarters of the window, which is where staleness is
+    // declared — every one of these polls finds nothing, and none of them may
+    // fail.
+    for poll in 0..10 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let batch = reader
+            .next_batch()
+            .await
+            .unwrap_or_else(|e| panic!("idle poll {poll} must not fail: {e}"));
+        assert!(batch.is_empty(), "nothing was published");
+    }
+
+    // And the first event after the idle stretch arrives, rather than being
+    // stamped past by a re-baseline the reader should never have needed.
+    writer
+        .publish("ticks", &Tick { generation: 1 })
+        .await
+        .expect("publishing");
+    let batch = reader.next_batch().await.expect("catching up");
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].seq(), 1);
+}
+
 /// A fresh cursor is *not* stale, which is what keeps the check above from
 /// being a permanently-armed alarm.
 #[tokio::test]

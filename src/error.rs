@@ -307,6 +307,32 @@ pub enum StoreError {
         event: String,
     },
 
+    /// Two readers share one consumer id, and the other one moved the shared
+    /// cursor while this batch was being read.
+    ///
+    /// A cursor is named by its consumer id, so two processes draining under one
+    /// id drain *one* cursor — and each sees only what the other has not already
+    /// consumed. The guarded advance detects that: the loser's `WHERE` matches
+    /// nothing, and it is told so rather than winding the shared mark backwards.
+    ///
+    /// **The reader stays usable.** Nothing was recorded and the cursor was not
+    /// written, so the reader is exactly as it was before the call; the batch it
+    /// had decoded is dropped, because the other reader's advance means those
+    /// events are that reader's to deliver. A retry is not the remedy — the two
+    /// readers would simply race again. Give each one its own consumer id.
+    ///
+    /// Unlike [`Self::BusGap`] and [`Self::BusStale`] this is a configuration
+    /// mistake rather than a data condition, which is why it is neither
+    /// [`Self::Corrupt`] nor a re-baseline case.
+    #[error(
+        "the notification bus cursor for `{consumer}` moved while a batch was being read; \
+         another reader shares this consumer id"
+    )]
+    BusRaced {
+        /// The consumer id whose cursor is shared.
+        consumer: String,
+    },
+
     /// A bus consumer's cursor is old enough that change capture may already
     /// have discarded events it has not seen.
     ///
@@ -355,12 +381,29 @@ impl StoreError {
     /// almost no real conflicts, because a client transaction is where they
     /// happen — RocksDB detects at commit time, so its conflicts arrive by the
     /// second route exclusively.
+    ///
+    /// # A third shape, which is this crate's own
+    ///
+    /// A bus publish allocates its sequence number *before* composing its
+    /// transaction — the event's record id is the digest of `(stream, seq)` —
+    /// and the transaction re-reads the counter and refuses to proceed if it
+    /// moved. Losing that race is optimistic contention in the same sense the
+    /// engine's own conflicts are: nothing was applied, another writer got
+    /// there first, and re-running is both safe and the correct response. The
+    /// publish absorbs a bounded number of those internally; past that budget it
+    /// surfaces, and it surfaces as a **conflict** so the documented retry
+    /// contract covers exactly the transient contention it exists for.
+    ///
+    /// The text it is keyed on is a crate-owned sentinel this store throws
+    /// itself, not upstream wording it transcribes, so unlike its two
+    /// neighbours this arm cannot be disarmed by an SDK rewording.
     #[must_use]
     pub fn is_conflict(&self) -> bool {
         match self {
             Self::Db(e) => {
                 matches!(e.query_details(), Some(QueryError::TransactionConflict))
                     || e.message().contains(CONFLICT_MESSAGE)
+                    || e.message().contains(STALE_SEQUENCE_SENTINEL)
             }
             _ => false,
         }
@@ -434,6 +477,11 @@ pub(crate) fn is_undefined_table_guard(e: &surrealdb::Error, table: &str) -> boo
 /// It carries no apostrophe and no semicolon, deliberately: it is formatted into
 /// query text, where a quote would make the surrounding statement unreadable at
 /// best and a semicolon would look like a statement boundary that is not one.
+///
+/// It is also what [`StoreError::is_conflict`] keys its third arm on: losing
+/// this race is optimistic contention, so a publish that exhausts its internal
+/// re-preparations must land in the retryable tier rather than outside every
+/// classifier.
 pub(crate) const STALE_SEQUENCE_SENTINEL: &str = "catgraph-surreal: the next sequence number for this stream moved, so the prepared publish \
      is stale";
 
@@ -653,6 +701,22 @@ mod tests {
         assert!(!err.is_shutdown());
     }
 
+    /// A publish that exhausted its internal re-preparations is reporting
+    /// optimistic contention, and the retry contract has to cover it: before
+    /// this arm existed the sentinel satisfied neither classifier, so the one
+    /// failure the bus's own documentation tells a caller to retry was the one
+    /// [`is_retryable`](crate::retry::is_retryable) refused.
+    #[test]
+    fn an_exhausted_publish_preparation_is_a_conflict() {
+        let err = StoreError::Db(surrealdb::Error::query(
+            format!("An error occurred: {STALE_SEQUENCE_SENTINEL}"),
+            None,
+        ));
+        assert!(err.query_details_are_absent());
+        assert!(err.is_conflict());
+        assert!(!err.is_shutdown());
+    }
+
     /// The load-bearing negative: an ordinary internal error must not be swept
     /// into the retry loop by the message check.
     #[test]
@@ -757,6 +821,9 @@ mod tests {
             StoreError::BusStale {
                 age_secs: 90,
                 retention_secs: 100,
+            },
+            StoreError::BusRaced {
+                consumer: "worker-1".to_owned(),
             },
         ];
         for err in cases {

@@ -214,7 +214,7 @@ impl WeightStore {
         // live on the shared executor — see `Store::run_write`.
         self.store
             .run_write(
-                WEIGHT_TABLE,
+                &[WEIGHT_TABLE],
                 PUT,
                 ("row", WeightRow::from_record(record)),
                 Refusals::none()

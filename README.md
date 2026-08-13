@@ -259,7 +259,9 @@ Each stream numbers its events from zero, contiguously, from a per-stream counte
 allocated inside the same transaction that writes the event. That counter is also
 the write-skew fence: two publishers that only *read* it could both take the same
 number, but because both also write it they collide and one is refused as a
-retryable conflict.
+retryable conflict. A publisher also absorbs a bounded number of *lost* number
+races internally, with jittered backoff; past that bound the condition surfaces
+classified as a conflict, so `retry()` covers it like any other contention.
 
 Catch-up reads the change feed from a persisted high-water mark and asserts
 contiguity, which turns the two ways a bus can go wrong into named errors:
@@ -268,6 +270,19 @@ enough that retention may already have discarded events — silently, since expi
 signals nothing. Both have one remedy: `rebaseline()`, which adopts the durable
 rows and starts again. A restore needs it too, because an import emits no
 change-feed entries and no notifications at all.
+
+The mark is *both* the versionstamp and the per-stream sequence expectations, and
+both live on the cursor row: expectations kept only in memory reset at every
+reader restart, so a hole punched while a consumer was down would pass as a first
+sighting. A poll that finds nothing still writes the cursor, which is what keeps
+a healthy reader on a quiet bus from ageing into `BusStale` while doing
+everything right.
+
+A third named error is not a data condition at all. `BusRaced` means a **second
+reader under the same consumer id** moved the shared cursor first — consumer ids
+name cursors, so sharing one means sharing a cursor. Neither retrying nor
+re-baselining helps; give each reader an id of its own. The reader that lost is
+left untouched and stays usable.
 
 `subscribe()` hands the caller a `Stream` and this crate spawns nothing: the
 caller owns the loop, the cancellation, and ending the subscription — which is
@@ -336,8 +351,9 @@ Several variants look retryable and are not, so they are worth naming:
 `Duplicate` (a unique index refusing a write — the equivalent record is already
 stored, and finding it is a read), `ReadOnly` (a write-once column refusing a
 *changed* value), `Immutable` (a write-once event refusing an update or delete),
-and `BusGap` / `BusStale` (events lost, or a cursor that can no longer be
-trusted — both call for `rebaseline()`, not another attempt).
+`BusGap` / `BusStale` (events lost, or a cursor that can no longer be trusted —
+both call for `rebaseline()`, not another attempt), and `BusRaced` (two readers
+sharing one consumer id, whose remedy is a second id rather than a second try).
 
 Three subtleties are documented on the type itself, because getting any of them
 wrong loses data rather than merely erroring:

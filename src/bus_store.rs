@@ -54,8 +54,12 @@
 //! **re-read the counter and refuse to proceed if it moved** — a publisher whose
 //! read was overtaken would otherwise file an event under one number while the
 //! row carried another. Losing that race is ordinary under contention, so
-//! `publish` re-prepares and tries again rather than reporting it; only a
-//! genuine transaction conflict reaches the caller.
+//! `publish` re-prepares (with a small jittered backoff) and tries again rather
+//! than reporting it. Only when that budget runs out does the condition reach
+//! the caller — and it reaches them classified as a **conflict**, because that
+//! is what it is: nothing was applied and another writer got there first.
+//! [`retry`](mod@crate::retry) therefore covers it exactly as it covers the
+//! engine's own conflicts.
 //!
 //! **Publishing is at-least-once under retry.** A commit that succeeded but was
 //! reported as failed will be retried, and the retry allocates a *new* number —
@@ -78,6 +82,18 @@
 //! durable rows and starts again from what is actually there. A restore is the
 //! third case with the same remedy: an import emits no change-feed entries and
 //! no notifications at all, so a consumer's cursor means nothing afterwards.
+//!
+//! A third failure is neither of those and has a different remedy:
+//! [`StoreError::BusRaced`] means a *second reader under the same consumer id*
+//! moved the shared cursor first. Re-baselining would not help and neither would
+//! retrying — the two readers would race again. Consumer ids name cursors, so
+//! independent readers need distinct ones.
+//!
+//! Both the cursor's position and its per-stream expectations live on the cursor
+//! row and are written together, which is what lets a restarted reader resume
+//! detection rather than start over. A reader that kept its expectations in
+//! memory alone would treat every stream as newly sighted after a restart, and a
+//! hole punched while it was down would pass unremarked.
 
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -127,11 +143,24 @@ static PUBLISH: LazyLock<String> = LazyLock::new(|| {
     )
 });
 
+/// The tables [`PUBLISH`] writes, in the order the guard checks them.
+///
+/// **Both**, because the statement writes both: the event row and the stream's
+/// sequence allocator. Guarding the event table alone would leave `bus_seq`
+/// exposed to the condition the guard exists to close — a `REMOVE TABLE bus_seq`
+/// followed by a publish would silently re-create it `TYPE ANY SCHEMALESS`, and
+/// the allocator is the one row that makes sequence numbers a total order rather
+/// than a hope.
+///
+/// The event table leads, so it is the one a classified refusal names.
+const PUBLISH_TABLES: &[&str] = &[BUS_TABLE, BUS_SEQ_TABLE];
+
 /// The slot the publish statement's `RETURN $seq` lands in.
 ///
-/// Four statements precede it, and the guard wrapper occupies the two slots
-/// before those — see [`Store::FIRST_STATEMENT_SLOT`].
-const PUBLISH_SEQ_SLOT: usize = Store::FIRST_STATEMENT_SLOT + 4;
+/// Four statements precede it, and the guard wrapper occupies the slots before
+/// those — one per guarded table, plus `BEGIN`. See
+/// [`Store::first_statement_slot`].
+const PUBLISH_SEQ_SLOT: usize = Store::first_statement_slot(PUBLISH_TABLES.len()) + 4;
 
 /// How many times a publish re-prepares after losing its sequence number to
 /// another publisher.
@@ -140,36 +169,69 @@ const PUBLISH_SEQ_SLOT: usize = Store::FIRST_STATEMENT_SLOT + 4;
 /// re-runs the whole call. This is the store re-reading a counter that moved
 /// between two of its own statements, which is a normal outcome under
 /// contention and not something a caller should have to know about.
+///
+/// Exhausting the budget is *not* a dead end: the sentinel classifies as a
+/// conflict (see [`StoreError::is_conflict`]), so the caller's own
+/// [`retry`](mod@crate::retry) loop covers it like any other contention.
 const PUBLISH_PREPARATIONS: u32 = 8;
+
+/// The backoff between two of a publish's own re-preparations.
+///
+/// Small — this is a re-read of one row, not a round of a distributed protocol —
+/// but not zero, and jittered. Two publishers that lost the same race would
+/// otherwise re-read the counter in lockstep and lose it again on the same
+/// schedule, which turns a budget of eight attempts into eight copies of one
+/// attempt.
+static PUBLISH_BACKOFF: LazyLock<crate::retry::RetryPolicy> = LazyLock::new(|| {
+    crate::retry::RetryPolicy::new()
+        .base_delay(Duration::from_micros(200))
+        .max_delay(Duration::from_millis(5))
+});
+
+/// The table the cursor statements write.
+const CURSOR_TABLES: &[&str] = &[BUS_MARK_TABLE];
 
 /// Create the consumer's cursor if it is not already there, then read it.
 ///
 /// `UPSERT … SET` rather than `CONTENT` so that an existing cursor is not reset:
 /// the write only names the consumer, leaving a mark that is already there
 /// alone. A fresh cursor starts at versionstamp zero, which reads the feed from
-/// the beginning.
+/// the beginning, and with no streams seen.
 const OPEN_CURSOR: &str = "\
 UPSERT $row.cursor SET \
     consumer = $row.consumer, \
     versionstamp = versionstamp ?? 0, \
-    stamped_at = stamped_at ?? time::now() \
+    stamped_at = stamped_at ?? time::now(), \
+    seen = seen ?? '[]' \
 RETURN NONE; \
-SELECT versionstamp, duration::secs(time::now() - stamped_at) AS age FROM ONLY $row.cursor";
+SELECT versionstamp, seen, duration::secs(time::now() - stamped_at) AS age \
+FROM ONLY $row.cursor";
 
 /// The slot [`OPEN_CURSOR`]'s read lands in.
-const OPEN_CURSOR_SLOT: usize = Store::FIRST_STATEMENT_SLOT + 1;
+const OPEN_CURSOR_SLOT: usize = Store::first_statement_slot(CURSOR_TABLES.len()) + 1;
 
-/// Advance the cursor, but only from the versionstamp it is expected to hold.
+/// Stamp the cursor, but only from the versionstamp it is expected to hold.
 ///
 /// The `WHERE` clause is the second write-skew fence: a reader whose cursor
 /// moved underneath it — a second process draining the same consumer id — writes
 /// nothing and finds out, rather than winding the shared mark backwards.
-const ADVANCE_CURSOR: &str = "\
-UPDATE $row.cursor SET versionstamp = $row.next, stamped_at = time::now() \
+///
+/// One statement covers both jobs a cursor write has, and deliberately. Moving
+/// the mark forward is the obvious one. The other is **renewing freshness on a
+/// poll that found nothing**: `stamped_at` is what the staleness prediction is
+/// measured against, so a reader that only wrote it when the feed had moved
+/// would age past the window on a quiet bus while doing everything right — and
+/// then be told to re-baseline, which discards the first event to arrive. A poll
+/// that drained the feed to its end has genuinely re-established the cursor's
+/// freshness whether or not the end moved, and writing that down is one row
+/// update.
+const STAMP_CURSOR: &str = "\
+UPDATE $row.cursor SET \
+    versionstamp = $row.next, stamped_at = time::now(), seen = $row.seen \
 WHERE versionstamp = $row.expected RETURN AFTER";
 
-/// The slot [`ADVANCE_CURSOR`]'s result lands in.
-const ADVANCE_CURSOR_SLOT: usize = Store::FIRST_STATEMENT_SLOT;
+/// The slot [`STAMP_CURSOR`]'s result lands in.
+const STAMP_CURSOR_SLOT: usize = Store::first_statement_slot(CURSOR_TABLES.len());
 
 /// Read the highest sequence number on every stream, straight from the durable
 /// rows.
@@ -213,19 +275,31 @@ struct PublishWrite {
     payload: serde_json::Value,
 }
 
-/// Everything the cursor statements bind.
+/// What [`OPEN_CURSOR`] binds.
 #[derive(Debug, Clone, SurrealValue)]
-struct CursorWrite {
+struct CursorOpen {
     cursor: RecordId,
     consumer: String,
+}
+
+/// What [`STAMP_CURSOR`] binds.
+#[derive(Debug, Clone, SurrealValue)]
+struct CursorStamp {
+    cursor: RecordId,
+    /// The versionstamp the cursor must still hold for the write to land.
     expected: i64,
+    /// The versionstamp to leave it at — equal to `expected` on a poll that
+    /// found nothing, which renews freshness without moving the mark.
     next: i64,
+    /// The per-stream expectations, as the opaque JSON string the column holds.
+    seen: String,
 }
 
 /// The cursor as it reads back.
 #[derive(Debug, Clone, SurrealValue)]
 struct CursorRow {
     versionstamp: i64,
+    seen: String,
     age: i64,
 }
 
@@ -313,6 +387,8 @@ impl BusWriter {
     /// - A **transaction conflict** if another publisher allocated from the same
     ///   stream concurrently. Retry the whole call — see [`retry`](mod@crate::retry). The
     ///   retry allocates a new number, which is why publishing is at-least-once.
+    ///   A publish that exhausted its own re-preparations classifies as a
+    ///   conflict too, for the same reason and with the same remedy.
     /// - A database error otherwise.
     pub async fn publish<T: Serialize>(&self, stream: &str, payload: &T) -> Result<i64> {
         let pending = bus::prepare(stream, payload)?;
@@ -330,7 +406,13 @@ impl BusWriter {
                 Ok(seq) => return Ok(seq),
                 Err(e) if error::is_stale_sequence(&e) && attempt + 1 < PUBLISH_PREPARATIONS => {
                     attempt += 1;
+                    // Jittered, so two publishers that lost the same race do not
+                    // come back for the counter together.
+                    crate::retry::pause(PUBLISH_BACKOFF.delay_before(attempt)).await;
                 }
+                // Out of re-preparations: this is contention, and saying so is
+                // what puts it in the caller's retry tier rather than outside
+                // every classifier.
                 Err(e) => return Err(e),
             }
         }
@@ -357,7 +439,7 @@ impl BusWriter {
         let mut response = self
             .store
             .run_write_response(
-                BUS_TABLE,
+                PUBLISH_TABLES,
                 PUBLISH.as_str(),
                 ("row", write),
                 Refusals::none().with_readonly_fields(&BUS_FIELDS),
@@ -388,10 +470,16 @@ impl BusWriter {
 /// Reads the durable bus: catch-up from a persisted cursor, and a live wakeup.
 ///
 /// A reader keeps the per-stream sequence numbers it has already seen, which is
-/// what lets it assert contiguity across batches. The first batch after
-/// [`Self::open`] *seeds* those expectations rather than asserting against them —
-/// a fresh reader has nothing to be contiguous with — so a gap that opened while
-/// no reader existed is caught by the cursor's age rather than by its sequence
+/// what lets it assert contiguity across batches. Those expectations live **on
+/// the cursor row**, beside the versionstamp, and are loaded at construction:
+/// held in memory alone they would reset at every reader restart, and a hole
+/// punched while a consumer was down would then pass as a first sighting. The
+/// two halves of the mark are written together, so a restarted reader resumes
+/// with both or neither.
+///
+/// A stream's *first* sighting still seeds rather than asserts — there is
+/// nothing to be contiguous with — so a gap that opened before any reader
+/// existed at all is caught by the cursor's age rather than by its sequence
 /// numbers.
 #[derive(Debug)]
 pub struct BusReader {
@@ -462,6 +550,10 @@ impl BusReader {
         };
         let row = reader.open_cursor().await?;
         reader.versionstamp = row.versionstamp;
+        // The expectations a previous reader under this id left behind. Without
+        // them a restart would have nothing to be contiguous with, and a hole
+        // punched while it was down would read as a first sighting.
+        reader.seen = decode_seen(&row.seen)?;
         Ok(reader)
     }
 
@@ -496,9 +588,15 @@ impl BusReader {
     ///
     /// Pages the change feed until it is exhausted, decodes the created bus rows
     /// out of it, checks each stream's sequence numbers for contiguity, and
-    /// advances the persisted cursor — all before returning, so a caller that
+    /// writes the persisted cursor — all before returning, so a caller that
     /// drops the batch has still consumed it. A caller that must not lose a batch
     /// should process it before the next call rather than relying on the cursor.
+    ///
+    /// The cursor is written even when the batch is empty. That is not a wasted
+    /// round trip: the write is what renews the freshness the staleness
+    /// prediction is measured against, and without it a reader polling a quiet
+    /// bus ages out of its own window — see [`Self::rebaseline`] for the remedy
+    /// it would then be pointlessly sent to.
     ///
     /// # Change-feed mechanics worth knowing
     ///
@@ -518,6 +616,23 @@ impl BusReader {
     /// over several calls rather than one. Nothing is lost either way — the
     /// cursor only advances over what was read.
     ///
+    /// # A batch is checked, then committed — in that order
+    ///
+    /// Contiguity is asserted against a **scratch** copy of the expectations
+    /// that is advanced event by event, and the scratch replaces the reader's
+    /// own only once the cursor write has landed. Two things fall out of that,
+    /// and both were wrong before it:
+    ///
+    /// - Two events on one stream *inside a single batch* are contiguous with
+    ///   **each other**. Checking a whole batch against a view frozen at its
+    ///   start reports a gap on the second one — and the documented remedy for a
+    ///   gap, re-baselining, then discards the very events that were there all
+    ///   along.
+    /// - A raced cursor advance leaves the reader **unchanged**. Recording
+    ///   sequence numbers and then failing to move the mark would mean the
+    ///   reader had noted events it returned to nobody, and every later batch
+    ///   would be measured against expectations built from them.
+    ///
     /// # Errors
     ///
     /// - [`StoreError::BusStale`] if the cursor is old enough that retention may
@@ -525,8 +640,12 @@ impl BusReader {
     ///   [`Self::rebaseline`].
     /// - [`StoreError::BusGap`] if a stream's sequence numbers are not
     ///   contiguous. Events were lost; call [`Self::rebaseline`].
+    /// - [`StoreError::BusRaced`] if another reader sharing this consumer id
+    ///   moved the cursor first. The reader is untouched and still usable; the
+    ///   remedy is a consumer id of its own, not a retry.
     /// - [`StoreError::Corrupt`] if an event is not filed under its own
-    ///   `(stream, seq)` address.
+    ///   `(stream, seq)` address, or if a change-feed entry carries no
+    ///   versionstamp this cursor can address.
     /// - A database error otherwise.
     pub async fn next_batch(&mut self) -> Result<Vec<BusEvent>> {
         let cursor = self.open_cursor().await?;
@@ -542,15 +661,18 @@ impl BusReader {
             mark = last;
         }
 
+        // One live view, advanced as it is checked — see the note above on why
+        // a view frozen at the batch's start reports gaps that are not there.
+        let mut seen = self.seen.clone();
         for event in &events {
-            self.check_contiguity(event)?;
+            check_contiguity(&seen, event)?;
+            record_seen(&mut seen, event);
         }
-        for event in &events {
-            self.record_seen(event);
-        }
-        if mark != self.versionstamp {
-            self.advance(mark).await?;
-        }
+
+        // The cursor moves first and the expectations are adopted only if it
+        // did, so a raced advance costs this reader nothing but the batch.
+        self.stamp(mark, &seen).await?;
+        self.seen = seen;
         Ok(events)
     }
 
@@ -612,7 +734,9 @@ impl BusReader {
     ///
     /// # Errors
     ///
-    /// Fails if the durable rows or the cursor cannot be read or written.
+    /// Fails if the durable rows or the cursor cannot be read or written, or
+    /// with [`StoreError::BusRaced`] if another reader sharing this consumer id
+    /// moved the cursor first.
     pub async fn rebaseline(&mut self) -> Result<()> {
         let mut response = self.store.client().query(HIGH_WATER_ROWS.as_str()).await?;
         #[derive(SurrealValue)]
@@ -623,7 +747,7 @@ impl BusReader {
         let rows =
             error::take_absorbing_missing_table::<Vec<HighWater>>(response.take(0), BUS_TABLE)?
                 .unwrap_or_default();
-        self.seen = rows.into_iter().map(|row| (row.stream, row.seq)).collect();
+        let seen: Vec<(String, i64)> = rows.into_iter().map(|row| (row.stream, row.seq)).collect();
 
         // Drain the feed without decoding it, so the cursor lands at its current
         // end rather than at a point the next batch would re-read.
@@ -633,9 +757,13 @@ impl BusReader {
             let Some(last) = last else { break };
             mark = last;
         }
-        if mark != self.versionstamp {
-            self.advance(mark).await?;
-        }
+        // Unconditionally, even when the feed has not moved: this is the
+        // documented remedy for a *stale* cursor, and a remedy that skipped the
+        // write whenever there was nothing new would leave the cursor exactly as
+        // old as it was — reporting the same staleness on the next call, for
+        // ever.
+        self.stamp(mark, &seen).await?;
+        self.seen = seen;
         Ok(())
     }
 
@@ -674,20 +802,13 @@ impl BusReader {
     /// question is how long the row has been sitting there, and the database is
     /// where both the row and the reference clock are.
     async fn open_cursor(&self) -> Result<CursorRow> {
-        let write = CursorWrite {
+        let write = CursorOpen {
             cursor: self.cursor.clone(),
             consumer: self.consumer.clone(),
-            expected: 0,
-            next: 0,
         };
         let mut response = self
             .store
-            .run_write_response(
-                BUS_MARK_TABLE,
-                OPEN_CURSOR,
-                ("row", write),
-                Refusals::none(),
-            )
+            .run_write_response(CURSOR_TABLES, OPEN_CURSOR, ("row", write), Refusals::none())
             .await?;
         let row: Option<CursorRow> = response.take(OPEN_CURSOR_SLOT)?;
         row.ok_or_else(|| StoreError::Corrupt {
@@ -734,11 +855,29 @@ impl BusReader {
             let Value::Object(object) = changeset else {
                 continue;
             };
-            if let Some(Value::Number(number)) = object.get("versionstamp")
-                && let Some(versionstamp) = number.to_int()
-            {
-                last = Some(versionstamp);
-            }
+            // A changeset this reader cannot address is loud, not skipped. The
+            // cursor advances to the *last* versionstamp a page yielded, so an
+            // entry whose own stamp went unread would have its rows delivered
+            // and then delivered again on the next call — a duplicate the
+            // contiguity check reports as a gap, from a cause nothing names.
+            // Unreachable until versionstamps outgrow a signed 64-bit integer;
+            // reachable in principle, and silent is the wrong failure mode.
+            let Some(Value::Number(number)) = object.get("versionstamp") else {
+                return Err(StoreError::Corrupt {
+                    context: BUS_TABLE.to_owned(),
+                    detail: "a change-feed entry carries no numeric versionstamp".to_owned(),
+                });
+            };
+            let Some(versionstamp) = number.to_int() else {
+                return Err(StoreError::Corrupt {
+                    context: BUS_TABLE.to_owned(),
+                    detail: format!(
+                        "change-feed versionstamp `{number}` does not fit a signed 64-bit \
+                         integer, so a cursor cannot address it"
+                    ),
+                });
+            };
+            last = Some(versionstamp);
             let Some(Value::Array(changes)) = object.get("changes") else {
                 continue;
             };
@@ -759,72 +898,100 @@ impl BusReader {
         Ok((events, last))
     }
 
-    /// Assert that an event follows the last one seen on its stream.
-    fn check_contiguity(&self, event: &BusEvent) -> Result<()> {
-        let Some((_, last)) = self.seen.iter().find(|(name, _)| name == event.stream()) else {
-            // First sighting of this stream: nothing to be contiguous with. A
-            // gap that opened before any reader existed is the cursor's age to
-            // catch, not this.
-            return Ok(());
-        };
-        let expected = last.saturating_add(1);
-        if event.seq() != expected {
-            return Err(StoreError::BusGap {
-                expected: u64::try_from(expected).unwrap_or(0),
-                saw: u64::try_from(event.seq()).unwrap_or(0),
-            });
-        }
-        Ok(())
-    }
-
-    /// Remember an event as the last seen on its stream.
-    fn record_seen(&mut self, event: &BusEvent) {
-        match self
-            .seen
-            .iter_mut()
-            .find(|(name, _)| name == event.stream())
-        {
-            Some((_, last)) => *last = event.seq(),
-            None => self.seen.push((event.stream().to_owned(), event.seq())),
-        }
-    }
-
-    /// Move the persisted cursor forward, but only from where it is expected to
-    /// be.
+    /// Write the cursor's mark and its expectations, but only from the
+    /// versionstamp it is expected to hold.
     ///
     /// The guarded update is the write-skew fence for the cursor: two processes
     /// draining the same consumer id cannot wind the shared mark backwards,
-    /// because the loser's `WHERE` matches nothing and it is told so.
-    async fn advance(&mut self, to: i64) -> Result<()> {
-        let write = CursorWrite {
+    /// because the loser's `WHERE` matches nothing and it is told so — as
+    /// [`StoreError::BusRaced`], which names the condition rather than reporting
+    /// a corrupt document. Nothing is mutated on that path, here or in the
+    /// caller, so the reader is exactly as it was.
+    ///
+    /// `to` may equal the versionstamp already held: that is a poll that found
+    /// nothing, and the write is what renews the freshness the staleness
+    /// prediction is measured against.
+    async fn stamp(&mut self, to: i64, seen: &[(String, i64)]) -> Result<()> {
+        let write = CursorStamp {
             cursor: self.cursor.clone(),
-            consumer: self.consumer.clone(),
             expected: self.versionstamp,
             next: to,
+            seen: encode_seen(seen)?,
         };
         let mut response = self
             .store
             .run_write_response(
-                BUS_MARK_TABLE,
-                ADVANCE_CURSOR,
+                CURSOR_TABLES,
+                STAMP_CURSOR,
                 ("row", write),
                 Refusals::none(),
             )
             .await?;
-        let updated: Vec<CursorMark> = response.take(ADVANCE_CURSOR_SLOT)?;
+        let updated: Vec<CursorMark> = response.take(STAMP_CURSOR_SLOT)?;
         if updated.is_empty() {
-            return Err(StoreError::Corrupt {
-                context: BUS_MARK_TABLE.to_owned(),
-                detail: format!(
-                    "the cursor for `{}` moved while this batch was being read; another \
-                     reader shares this consumer id",
-                    self.consumer
-                ),
+            return Err(StoreError::BusRaced {
+                consumer: self.consumer.clone(),
             });
         }
         self.versionstamp = to;
         Ok(())
     }
+}
+
+/// Assert that an event follows the last one seen on its stream, in `seen`.
+///
+/// A free function over the view rather than a method on the reader, because the
+/// view it is asked about is the *scratch* one a batch is checked against — not
+/// the reader's own, which is only replaced once the batch is committed.
+fn check_contiguity(seen: &[(String, i64)], event: &BusEvent) -> Result<()> {
+    let Some((_, last)) = seen.iter().find(|(name, _)| name == event.stream()) else {
+        // First sighting of this stream: nothing to be contiguous with. A gap
+        // that opened before any reader existed is the cursor's age to catch,
+        // not this.
+        return Ok(());
+    };
+    let expected = last.saturating_add(1);
+    if event.seq() != expected {
+        return Err(StoreError::BusGap {
+            expected: u64::try_from(expected).unwrap_or(0),
+            saw: u64::try_from(event.seq()).unwrap_or(0),
+        });
+    }
+    Ok(())
+}
+
+/// Remember an event as the last seen on its stream.
+fn record_seen(seen: &mut Vec<(String, i64)>, event: &BusEvent) {
+    match seen.iter_mut().find(|(name, _)| name == event.stream()) {
+        Some((_, last)) => *last = event.seq(),
+        None => seen.push((event.stream().to_owned(), event.seq())),
+    }
+}
+
+/// The per-stream expectations, as the opaque JSON string the cursor column
+/// holds.
+///
+/// Sorted by stream name, so the same set of expectations is the same string
+/// whatever order the streams were first seen in — a stored value that varies
+/// with history is a value nobody can compare two of.
+fn encode_seen(seen: &[(String, i64)]) -> Result<String> {
+    let mut sorted: Vec<(&str, i64)> = seen
+        .iter()
+        .map(|(stream, last)| (stream.as_str(), *last))
+        .collect();
+    sorted.sort_unstable();
+    Ok(serde_json::to_string(&sorted)?)
+}
+
+/// The inverse of [`encode_seen`].
+///
+/// # Errors
+///
+/// [`StoreError::Codec`] if the column does not hold this encoding — which for a
+/// cursor written by any build of this store it does, so the failure means
+/// something else wrote it.
+fn decode_seen(raw: &str) -> Result<Vec<(String, i64)>> {
+    Ok(serde_json::from_str(raw)?)
 }
 
 /// The age at which a cursor is declared untrustworthy, for a given retention.
@@ -847,7 +1014,7 @@ fn stale_after(retention: Duration) -> u64 {
         .max(1)
 }
 
-/// The shape [`ADVANCE_CURSOR`] returns.
+/// The shape [`STAMP_CURSOR`] returns.
 #[derive(Debug, Clone, SurrealValue)]
 struct CursorMark {
     versionstamp: i64,
@@ -882,31 +1049,111 @@ mod tests {
     }
 
     /// The slot arithmetic is the one thing here that cannot be checked by
-    /// reading the statement: `BEGIN` and `COMMIT` occupy slots too, so the
-    /// offset is not zero.
+    /// reading the statement: `BEGIN` and `COMMIT` occupy slots too, and so does
+    /// **each** table's existence guard — so a statement that guards two tables
+    /// starts one slot later than one that guards a single table.
     #[test]
-    fn the_returned_slot_follows_the_guard_and_the_preceding_statements() {
-        assert_eq!(Store::FIRST_STATEMENT_SLOT, 2);
+    fn the_returned_slot_follows_the_guards_and_the_preceding_statements() {
+        assert_eq!(Store::first_statement_slot(1), 2);
+        assert_eq!(Store::first_statement_slot(2), 3);
         assert_eq!(PUBLISH.matches(';').count(), 4);
-        assert_eq!(PUBLISH_SEQ_SLOT, 6);
+        assert_eq!(PUBLISH_SEQ_SLOT, 7);
         assert_eq!(OPEN_CURSOR_SLOT, 3);
-        assert_eq!(ADVANCE_CURSOR_SLOT, 2);
+        assert_eq!(STAMP_CURSOR_SLOT, 2);
+    }
+
+    /// A publish writes the event *and* the allocator, so both are guarded. A
+    /// guard on the event table alone would let `REMOVE TABLE bus_seq` be
+    /// silently repaired as a schemaless impostor by the next publish.
+    #[test]
+    fn the_guarded_tables_are_every_table_the_statement_writes() {
+        assert_eq!(PUBLISH_TABLES, &[BUS_TABLE, BUS_SEQ_TABLE]);
+        assert_eq!(CURSOR_TABLES, &[BUS_MARK_TABLE]);
+        // The primary table leads: it is the one a classified refusal names.
+        assert_eq!(PUBLISH_TABLES.first(), Some(&BUS_TABLE));
     }
 
     /// The cursor's creation must not reset a cursor that is already there —
-    /// that would wind every consumer back to the start of the feed on open.
+    /// that would wind every consumer back to the start of the feed on open, and
+    /// throw away the expectations that make gap detection survive a restart.
     #[test]
     fn opening_a_cursor_preserves_an_existing_mark() {
         assert!(OPEN_CURSOR.contains("versionstamp = versionstamp ?? 0"));
+        assert!(OPEN_CURSOR.contains("seen = seen ?? '[]'"));
         assert!(!OPEN_CURSOR.contains("CONTENT"));
+        // Both halves of the mark are read back: a reader that loaded the
+        // versionstamp without the expectations would resume in the feed while
+        // starting over on detection.
+        assert!(OPEN_CURSOR.contains("SELECT versionstamp, seen, "));
     }
 
-    /// The cursor advance is conditional, which is what makes a second reader on
-    /// the same consumer id a detectable condition rather than a lost mark.
+    /// The cursor write is conditional, which is what makes a second reader on
+    /// the same consumer id a detectable condition rather than a lost mark — and
+    /// it writes the freshness stamp and the expectations alongside the mark, in
+    /// one statement, so the three cannot disagree.
     #[test]
-    fn advancing_a_cursor_is_guarded_by_the_versionstamp_it_expects() {
-        assert!(ADVANCE_CURSOR.contains("WHERE versionstamp = $row.expected"));
-        assert!(ADVANCE_CURSOR.contains("RETURN AFTER"));
+    fn stamping_a_cursor_is_guarded_by_the_versionstamp_it_expects() {
+        assert!(STAMP_CURSOR.contains("WHERE versionstamp = $row.expected"));
+        assert!(STAMP_CURSOR.contains("RETURN AFTER"));
+        assert!(STAMP_CURSOR.contains("stamped_at = time::now()"));
+        assert!(STAMP_CURSOR.contains("seen = $row.seen"));
+    }
+
+    /// The stored expectations are order-independent: the same set is the same
+    /// string however the streams were first sighted, or two cursors that agree
+    /// would not compare equal.
+    #[test]
+    fn the_stored_expectations_are_canonical_and_round_trip() {
+        let forwards = vec![("goals".to_owned(), 4i64), ("ticks".to_owned(), 0)];
+        let backwards = vec![("ticks".to_owned(), 0i64), ("goals".to_owned(), 4)];
+        let encoded = encode_seen(&forwards).expect("expectations encode");
+        assert_eq!(encoded, r#"[["goals",4],["ticks",0]]"#);
+        assert_eq!(encode_seen(&backwards).expect("encodes"), encoded);
+        assert_eq!(decode_seen(&encoded).expect("decodes"), forwards);
+        assert!(
+            decode_seen("[]")
+                .expect("an empty cursor decodes")
+                .is_empty()
+        );
+    }
+
+    /// Contiguity is asked of a *view*, not of the reader, which is what lets a
+    /// batch be checked against a scratch copy before anything is committed —
+    /// and what makes two events on one stream contiguous with each other rather
+    /// than both with the batch's starting point.
+    #[test]
+    fn contiguity_is_checked_against_a_view_that_advances() {
+        let event = |stream: &str, seq: i64| {
+            BusEvent::from_columns(
+                bus::event_address(stream, seq),
+                bus::BUS_CODEC.to_owned(),
+                stream.to_owned(),
+                seq,
+                serde_json::json!({}),
+            )
+        };
+
+        let mut seen = Vec::new();
+        // A first sighting seeds rather than asserts, whatever number it holds.
+        check_contiguity(&seen, &event("goals", 7)).expect("a first sighting seeds");
+        record_seen(&mut seen, &event("goals", 7));
+
+        check_contiguity(&seen, &event("goals", 8)).expect("8 follows 7");
+        record_seen(&mut seen, &event("goals", 8));
+        check_contiguity(&seen, &event("goals", 9)).expect("9 follows 8 in the same pass");
+        check_contiguity(&seen, &event("ticks", 3)).expect("another stream is its own sighting");
+
+        let err = check_contiguity(&seen, &event("goals", 10)).expect_err("10 does not follow 8");
+        assert!(
+            matches!(
+                err,
+                StoreError::BusGap {
+                    expected: 9,
+                    saw: 10
+                }
+            ),
+            "{err}"
+        );
     }
 
     /// The read projections are derived from the declared schema, so this pins

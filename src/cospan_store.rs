@@ -338,7 +338,7 @@ impl<L: LabelCodec> CospanStore<L> {
     ) -> Result<()> {
         self.store
             .run_write(
-                COSPAN_TABLE,
+                &[COSPAN_TABLE],
                 statement,
                 binding,
                 Refusals::none().with_unique_index(COSPAN_CANON_INDEX),

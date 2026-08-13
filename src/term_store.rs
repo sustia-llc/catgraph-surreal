@@ -289,7 +289,7 @@ where
         // the raw database error it is.
         self.store
             .run_write(
-                TERM_TABLE,
+                &[TERM_TABLE],
                 PUT,
                 ("row", TermRow::from_record(record)),
                 Refusals::none(),
@@ -321,7 +321,7 @@ where
         let addrs: Vec<TermAddr> = records.iter().map(|r| r.addr().clone()).collect();
         let rows: Vec<TermRow> = records.into_iter().map(TermRow::from_record).collect();
         self.store
-            .run_write(TERM_TABLE, PUT_MANY, ("rows", rows), Refusals::none())
+            .run_write(&[TERM_TABLE], PUT_MANY, ("rows", rows), Refusals::none())
             .await?;
         Ok(addrs)
     }

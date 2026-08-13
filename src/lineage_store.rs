@@ -62,7 +62,7 @@ use crate::schema::{
     RULE_SET_FIELDS, RULE_SET_TABLE, TERM_TABLE,
 };
 use crate::store::Store;
-use crate::term::{self, TermRecord};
+use crate::term::TermRecord;
 use crate::term_store::TermRow;
 
 /// Write one rule set, creating it or leaving an identical row untouched.
@@ -91,6 +91,18 @@ LET $edge = $row.edge; \
 LET $child = $row.child; \
 RELATE OR UPDATE $parent -> $edge -> $child CONTENT $row.edge_data RETURN NONE";
 
+/// The tables [`RECORD_RUN`] writes, in the order the guard checks them.
+///
+/// **Both**, because the statement writes both: the trace row and the `RELATE`
+/// that files the edge. Guarding only the trace table would leave `derives`
+/// exposed to exactly the condition the guard exists to close — a
+/// `REMOVE TABLE derives` followed by a recorded run would silently re-create it
+/// `TYPE ANY SCHEMALESS`, dropping the relation typing, the `READONLY` columns
+/// and the id `ASSERT` in one go, with every documented signal still green.
+///
+/// The trace table leads, so it is the one a classified refusal names.
+const RECORD_RUN_TABLES: &[&str] = &[REWRITE_RUN_TABLE, DERIVES_TABLE];
+
 /// Read one run's columns.
 static GET_RUN: LazyLock<String> =
     LazyLock::new(|| format!("SELECT {} FROM $rid", REWRITE_RUN_FIELDS.join(", ")));
@@ -110,6 +122,11 @@ static EDGES_OF_RUN: LazyLock<String> = LazyLock::new(|| {
 });
 
 /// Read the edges leading out of a term.
+///
+/// Filtering on `in` is what the
+/// [`derives_in`](crate::schema::DERIVES_IN_INDEX) index exists for: the planner
+/// builds its candidate set only from defined indexes, so without one this
+/// traversal is a full scan of the edge table on every hop.
 static EDGES_FROM_TERM: LazyLock<String> = LazyLock::new(|| {
     format!(
         "SELECT {} FROM {DERIVES_TABLE} WHERE in = $rid",
@@ -500,7 +517,7 @@ where
         let addr = record.addr().clone();
         self.store
             .run_write(
-                RULE_SET_TABLE,
+                &[RULE_SET_TABLE],
                 PUT_RULE_SET,
                 ("row", RuleSetRow::from_record(record)),
                 // A readonly refusal here would mean two distinct encodings
@@ -569,14 +586,18 @@ where
         outcome: &RewriteOutcome<G>,
         cost_model: &str,
     ) -> Result<RunAddr> {
-        let record = lineage::encode_run(rule_set, start, outcome, cost_model)?;
+        // The run's address covers its endpoints, so encoding them happens here
+        // whatever else does — and it is the expensive half of the call. Taking
+        // them back out is what keeps this from encoding the same two terms
+        // twice.
+        let (record, endpoints) =
+            lineage::encode_run_with_endpoints(rule_set, start, outcome, cost_model)?;
         let edge = lineage::encode_derivation(&record)?;
         let addr = record.addr().clone();
 
         // The endpoints, outside the transaction: idempotent, content-addressed,
         // and harmless to race on.
-        self.put_terms(&[term::encode(start)?, term::encode(outcome.best())?])
-            .await?;
+        self.put_terms(endpoints.into()).await?;
 
         let write = RunWrite {
             parent: RecordId::new(TERM_TABLE, edge.parent().as_str()),
@@ -592,7 +613,7 @@ where
         };
         self.store
             .run_write(
-                REWRITE_RUN_TABLE,
+                RECORD_RUN_TABLES,
                 RECORD_RUN,
                 ("row", write),
                 // Both tables here are write-once by construction, so a readonly
@@ -607,11 +628,15 @@ where
     }
 
     /// Store the endpoint terms, in one statement.
-    async fn put_terms(&self, records: &[TermRecord]) -> Result<()> {
-        let rows: Vec<TermRow> = records.iter().cloned().map(TermRow::from_record).collect();
+    ///
+    /// Takes the records by value: they are built for this call and nothing else
+    /// reads them afterwards, so cloning to build the rows would be a copy of
+    /// two whole term encodings for nothing.
+    async fn put_terms(&self, records: Vec<TermRecord>) -> Result<()> {
+        let rows: Vec<TermRow> = records.into_iter().map(TermRow::from_record).collect();
         self.store
             .run_write(
-                TERM_TABLE,
+                &[TERM_TABLE],
                 "FOR $row IN $rows { UPSERT $row.id CONTENT $row RETURN NONE; }",
                 ("rows", rows),
                 Refusals::none(),
@@ -684,5 +709,17 @@ mod tests {
     #[test]
     fn the_relate_statement_does_not_use_only() {
         assert!(!RECORD_RUN.contains("ONLY"));
+    }
+
+    /// The guard covers every table the statement writes. `RELATE` writes the
+    /// edge table, which is not the table the write is filed under — and a guard
+    /// that named only the trace table would let a removed `derives` be silently
+    /// re-created schemaless by the next recorded run.
+    #[test]
+    fn the_guarded_tables_are_every_table_the_statement_writes() {
+        assert_eq!(RECORD_RUN_TABLES, &[REWRITE_RUN_TABLE, DERIVES_TABLE]);
+        // The primary table leads: it is the one a classified refusal names, and
+        // the `READONLY` list passed beside it is the trace table's.
+        assert_eq!(RECORD_RUN_TABLES.first(), Some(&REWRITE_RUN_TABLE));
     }
 }

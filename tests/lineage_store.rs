@@ -394,6 +394,75 @@ async fn the_raw_identifier_field_binds_to_the_in_column() {
     assert_eq!(rows.len(), 1);
 }
 
+/// **The traversal actually uses the index**, not merely "an index exists".
+///
+/// The two are different claims and only the second is free: the planner builds
+/// its candidate set from defined indexes, so a `WHERE in = …` with no index on
+/// `in` is a full scan of the edge table on every hop — correct, and the tier's
+/// dominant cost the moment the graph is large. Asserting the definition alone
+/// would leave the reason for the definition unchecked, so this reads the plan.
+#[tokio::test]
+async fn the_forward_traversal_is_served_by_an_index() {
+    let (store, lineage) = bootstrapped("lineage_edge_plan").await;
+    let (rule_set, start, outcome) = a_run(&lineage).await;
+    let run = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("recording");
+    let stored = lineage
+        .get_run(&run)
+        .await
+        .expect("loading")
+        .expect("present");
+
+    let mut response = store
+        .client()
+        .query(format!(
+            "SELECT id FROM {} WHERE in = $rid EXPLAIN",
+            schema::DERIVES_TABLE
+        ))
+        .bind((
+            "rid",
+            RecordId::new(schema::TERM_TABLE, stored.start().as_str()),
+        ))
+        .await
+        .expect("explaining the traversal");
+    let plan: Vec<surrealdb::types::Value> = response.take(0).expect("the plan reads back");
+    let rendered = format!("{plan:?}");
+    assert!(
+        rendered.contains(schema::DERIVES_IN_INDEX),
+        "the forward traversal must be served by `{}`, not by a table scan: {rendered}",
+        schema::DERIVES_IN_INDEX
+    );
+}
+
+/// The declared indexes have to match the engine's own rendering, which is what
+/// the drift guard compares against. Pinned here because the rendering is the
+/// engine's to choose, not this crate's — `in` is a keyword, and whether it
+/// comes back bare or escaped is not something to guess at.
+#[tokio::test]
+async fn the_edge_indexes_are_the_engines_renderings() {
+    let (store, _lineage) = bootstrapped("lineage_edge_indexes").await;
+    let mut response = store
+        .client()
+        .query(format!(
+            "RETURN (INFO FOR TABLE {}).indexes",
+            schema::DERIVES_TABLE
+        ))
+        .await
+        .expect("reading the index definitions");
+    let live: Option<std::collections::BTreeMap<String, String>> =
+        response.take(0).expect("the definitions read back");
+    let live = live.unwrap_or_default();
+    for (name, definition) in schema::DERIVES_INDEX_DEFINITIONS {
+        assert_eq!(
+            live.get(name).map(String::as_str),
+            Some(definition),
+            "{name}"
+        );
+    }
+}
+
 // ------------------------------------------------------------ corrupt reads
 
 /// A run whose costs were edited in place does not match its own content
@@ -437,6 +506,51 @@ async fn a_tampered_run_is_corrupt_on_load() {
         .get_run(&run)
         .await
         .expect_err("an edited run is corrupt");
+    assert!(matches!(err, StoreError::Corrupt { .. }), "{err}");
+}
+
+/// **The edge's denormalized weighting is inside its content address**, so an
+/// edge re-labelled in place does not verify.
+///
+/// `rule_set` and `cost_model` are copies of columns the run already carries,
+/// kept on the edge so a traversal can read what a derivation's numbers mean
+/// without following it to the run. Under the `cge1` address — which digested
+/// only `(parent, child, run)` — they were the one pair of stored values in the
+/// tier that revalidation could not re-derive: an edge whose weighting had been
+/// swapped verified cleanly and misattributed every derivation it described.
+#[tokio::test]
+async fn an_edge_with_a_tampered_weighting_is_corrupt_on_load() {
+    let (store, lineage) = bootstrapped("lineage_tampered_edge").await;
+    let (rule_set, start, outcome) = a_run(&lineage).await;
+    let run = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("recording");
+    let stored = lineage
+        .get_run(&run)
+        .await
+        .expect("loading")
+        .expect("present");
+    let edge = lineage::encode_derivation(&stored).expect("the endpoints imply an edge");
+
+    // `OPTION IMPORT;` disables READONLY for the statement, which is how a
+    // hostile edit or a doctored dump would reach the column at all.
+    store
+        .client()
+        .query("OPTION IMPORT; UPDATE $rid SET cost_model = 'weighted' RETURN NONE")
+        .bind((
+            "rid",
+            RecordId::new(schema::DERIVES_TABLE, edge.addr().as_str()),
+        ))
+        .await
+        .expect("the edit runs")
+        .check()
+        .expect("and is accepted under OPTION IMPORT");
+
+    let err = lineage
+        .edges_of_run(&run)
+        .await
+        .expect_err("a re-labelled edge is corrupt");
     assert!(matches!(err, StoreError::Corrupt { .. }), "{err}");
 }
 
@@ -595,6 +709,95 @@ async fn a_removed_table_is_absent_to_reads_and_loud_to_writes() {
     assert_eq!(table, schema::REWRITE_RUN_TABLE);
 }
 
+/// **The other table a recorded run writes.** The statement writes the trace
+/// *and* `RELATE`s the derivation edge, so removing the edge table has to be as
+/// loud as removing the trace table.
+///
+/// This is the hole a single-table guard leaves, and on a relation table it is
+/// the expensive one: the auto-created impostor is `TYPE ANY SCHEMALESS`, so the
+/// `IN term OUT term` typing, the `READONLY` columns and the id `ASSERT` all
+/// vanish at once while `assert_schema` on `rewrite_run` stays green.
+#[tokio::test]
+async fn a_removed_edge_table_is_loud_to_writes() {
+    let (store, lineage) = bootstrapped("lineage_removed_edge_table").await;
+    let (rule_set, start, outcome) = a_run(&lineage).await;
+
+    store
+        .client()
+        .query(format!("REMOVE TABLE {}", schema::DERIVES_TABLE))
+        .await
+        .expect("removing the edge table")
+        .check()
+        .expect("and it is removed");
+
+    let err = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect_err("a RELATE against an undefined table must be loud");
+    let StoreError::Schema { table, .. } = &err else {
+        panic!("expected schema drift, got {err:?}");
+    };
+    assert_eq!(table, schema::DERIVES_TABLE);
+
+    // And the guard refused rather than repaired: the table stays undefined.
+    let mut response = store
+        .client()
+        .query(format!(
+            "RETURN (INFO FOR DB).tables.{}",
+            schema::DERIVES_TABLE
+        ))
+        .await
+        .expect("reading the table definition");
+    let definition: Option<String> = response.take(0).expect("the definition slot");
+    assert_eq!(definition, None, "the table must remain undefined");
+}
+
+/// The nested step fields carry no `READONLY` of their own, and that is not a
+/// hole for the same reason an array element's absent clause is not: writing
+/// `steps[0].rule` changes the value of the `steps` column, and `steps` is
+/// `READONLY`. Pinned because it is invisible in the definitions — the parallel
+/// of the cospan tier's element-write test.
+#[tokio::test]
+async fn a_nested_step_write_is_refused_by_the_parent_column() {
+    let (store, lineage) = bootstrapped("lineage_nested_write").await;
+    let (rule_set, start, outcome) = a_run(&lineage).await;
+    let run = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("recording");
+    let before = lineage
+        .get_run(&run)
+        .await
+        .expect("loading")
+        .expect("present");
+    assert!(!before.steps().is_empty(), "the fixture run rewrites");
+    assert_ne!(before.steps()[0].rule(), 9);
+
+    let outcome = store
+        .client()
+        .query("UPDATE $rid SET steps[0].rule = 9 RETURN NONE")
+        .bind((
+            "rid",
+            RecordId::new(schema::REWRITE_RUN_TABLE, run.as_str()),
+        ))
+        .await
+        .expect("the statement runs")
+        .check();
+    assert!(
+        outcome.is_err(),
+        "the parent `steps` column must refuse a nested write"
+    );
+
+    // And the trace is untouched — it still loads, and still revalidates against
+    // the address it is filed under.
+    let after = lineage
+        .get_run(&run)
+        .await
+        .expect("reading back")
+        .expect("still present");
+    assert_eq!(after.steps(), before.steps());
+}
+
 // ------------------------------------------------------------------ helpers
 
 async fn row_count(store: &Store, table: &str) -> usize {
@@ -613,5 +816,5 @@ async fn row_count(store: &Store, table: &str) -> usize {
 fn the_lineage_codecs_are_pinned() {
     assert_eq!(lineage::RULE_SET_CODEC, "cgs1");
     assert_eq!(lineage::REWRITE_RUN_CODEC, "cgt1");
-    assert_eq!(lineage::DERIVATION_CODEC, "cge1");
+    assert_eq!(lineage::DERIVATION_CODEC, "cge2");
 }

@@ -319,7 +319,7 @@ impl<T: Serialize + DeserializeOwned> DocStore<T> {
         self.inner
             .store
             .run_write(
-                DOCUMENT_TABLE,
+                &[DOCUMENT_TABLE],
                 PUT,
                 ("row", DocumentRow::from_record(DOCUMENT_TABLE, record)),
                 Refusals::none(),
@@ -376,7 +376,7 @@ impl<T: Serialize + DeserializeOwned> DocStore<T> {
         self.inner
             .store
             .run_write(
-                DOCUMENT_TABLE,
+                &[DOCUMENT_TABLE],
                 DELETE,
                 (
                     "row",
@@ -524,7 +524,7 @@ impl<T: Serialize + DeserializeOwned> ManifestStore<T> {
         self.inner
             .store
             .run_write(
-                MANIFEST_TABLE,
+                &[MANIFEST_TABLE],
                 PUT,
                 ("row", DocumentRow::from_record(MANIFEST_TABLE, record)),
                 Refusals::none()
