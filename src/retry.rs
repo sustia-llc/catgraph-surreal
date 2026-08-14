@@ -34,10 +34,14 @@
 //! # The engine decides the policy, not the test suite
 //!
 //! Conflict surfaces differ per engine, and the differences are not small. The
-//! in-memory engine aborts on *read* conflicts too, so it aborts more often than
-//! plain snapshot isolation; RocksDB detects at commit; SurrealKV detects write
-//! conflicts only. **A backoff tuned against the memory engine does not transfer
-//! to the persistent ones.** Measure against the engine actually deployed.
+//! in-memory engine additionally aborts on many *read* conflicts, so it aborts
+//! more often than plain snapshot isolation — though not exhaustively: its
+//! commit-time detection has been observed to miss, so contended flows put
+//! the read and the write in separate transactions behind a `WHERE`-guarded
+//! advance or a `CREATE` collision rather than resting on detection. RocksDB
+//! detects at commit; SurrealKV detects write conflicts only. **A backoff
+//! tuned against the memory engine does not transfer to the persistent
+//! ones.** Measure against the engine actually deployed.
 //!
 //! # Jitter, and where the randomness comes from
 //!

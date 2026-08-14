@@ -54,10 +54,14 @@
 //!   embedded use, detects write conflicts only, and has no durability soak
 //!   history behind it here. Data whose loss would be silent should not live
 //!   on it until a soak says otherwise.
-//! - **Conflict behaviour differs per engine.** The in-memory engine aborts on
-//!   read conflicts too, RocksDB detects at commit time, SurrealKV detects write
-//!   conflicts only. Retry tuning measured on the memory engine does not
-//!   transfer; tune against the engine actually deployed.
+//! - **Conflict behaviour differs per engine.** The in-memory engine
+//!   additionally aborts on many read conflicts — not exhaustively (its
+//!   commit-time detection has been observed to miss, which is why this
+//!   store's contended flows split reads and writes across transactions
+//!   behind guarded advances or `CREATE` collisions). RocksDB detects at
+//!   commit time against a pinned snapshot; SurrealKV detects write conflicts
+//!   only. Retry tuning measured on the memory engine does not transfer; tune
+//!   against the engine actually deployed.
 //!
 //! # Design commitments
 //!

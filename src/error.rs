@@ -27,10 +27,16 @@
 //! recognised.
 //!
 //! Engine conflict surfaces also differ, which matters when tuning backoff:
-//! the in-memory engine aborts on *read* conflicts too (so it aborts more often
-//! than plain snapshot isolation), RocksDB detects at commit, and SurrealKV
-//! detects write conflicts only. **Retry policy measured on the memory engine
-//! does not transfer to the persistent engines** — tune against RocksDB.
+//! the in-memory engine additionally aborts on many *read* conflicts (so it
+//! aborts more often than plain snapshot isolation — but **its detection is
+//! not exhaustive**: a single-transaction read-modify-write has been observed
+//! to lose an update, so contended flows put the read and the write in
+//! *separate* transactions behind a `WHERE`-guarded advance or a `CREATE`
+//! collision, as this store's cursor and sequence flows do, rather than
+//! resting on detection), RocksDB detects at commit against a pinned
+//! snapshot, and SurrealKV detects write conflicts only. **Retry policy
+//! measured on the memory engine does not transfer to the persistent
+//! engines** — tune against RocksDB.
 //!
 //! ## Shutdown: no structured discriminator exists
 //!

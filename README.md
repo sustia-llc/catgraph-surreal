@@ -310,9 +310,14 @@ Two engine caveats worth knowing before picking one:
 - **SurrealKV is the unsoaked engine.** It is documented as beta for embedded
   use and has no durability soak history behind it here. Data whose loss would
   be silent should not live there until a soak says otherwise.
-- **Conflict behaviour is engine-specific.** The in-memory engine aborts on read
-  conflicts too, RocksDB detects at commit time, SurrealKV detects write
-  conflicts only. Retry tuning measured on the memory engine does not transfer.
+- **Conflict behaviour is engine-specific.** The in-memory engine additionally
+  aborts on many read conflicts — but not exhaustively: its commit-time
+  detection has been observed to miss a racing write, so contended flows in
+  this store split the read and the write across transactions behind a
+  `WHERE`-guarded advance or a `CREATE` collision rather than resting on
+  detection. RocksDB detects at commit time against a pinned snapshot;
+  SurrealKV detects write conflicts only. Retry tuning measured on the memory
+  engine does not transfer.
 
 ### Why `server` enables both protocols
 
