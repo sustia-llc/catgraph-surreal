@@ -292,12 +292,10 @@ fn encode_coordinates(coordinates: &[f64]) -> Vec<u8> {
 /// guessed at — there is no reachable path that produces one.
 fn decode_coordinates(bytes: &[u8]) -> Vec<f64> {
     bytes
-        .chunks_exact(COORDINATE_WIDTH)
-        .map(|chunk| {
-            let mut word = [0u8; COORDINATE_WIDTH];
-            word.copy_from_slice(chunk);
-            f64::from_le_bytes(word)
-        })
+        .as_chunks::<COORDINATE_WIDTH>()
+        .0
+        .iter()
+        .map(|word| f64::from_le_bytes(*word))
         .collect()
 }
 
