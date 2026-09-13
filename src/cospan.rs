@@ -46,15 +46,16 @@
 //!   `Some(x)`, so two labels cannot share an encoding. Without that, two
 //!   distinct morphisms could share a key.
 //!
-//! # `Cospan::new` validates under `debug_assert!` only
+//! # The store bounds-checks legs itself
 //!
-//! Leg indices are checked against the apex size by a `debug_assert!`, so in a
-//! release build an out-of-bounds leg is accepted and defers its failure to a
-//! panic somewhere later — inside a composition, or inside this module's own
-//! canonicalisation. Both [`encode`] and [`CospanRecord::revalidate`] therefore
-//! bounds-check explicitly and report [`StoreError::Corrupt`]. Checking on the
-//! *write* side too is not redundant: a release-mode caller can hand this store
-//! an invalid value that no constructor ever rejected.
+//! `Cospan::new` checks both legs against the apex in every build profile.
+//! `Cospan::new_unchecked` and `Cospan::add_boundary_node_unchecked` check only
+//! under `debug_assert!`, so a release build accepts an out-of-bounds leg
+//! through either and defers its failure to whatever indexes it later. Both
+//! [`encode`] and [`CospanRecord::revalidate`] therefore bounds-check
+//! explicitly and report [`StoreError::Corrupt`]: the write side covers a value
+//! that reached this store through an unchecked constructor, the load side a
+//! column that arrives off disk.
 
 use catgraph::cospan::Cospan;
 use serde::Serialize;
@@ -90,8 +91,7 @@ type Class = (String, Vec<usize>, Vec<usize>);
 ///
 /// # Errors
 ///
-/// [`StoreError::Corrupt`] if any leg index is out of bounds for the apex — the
-/// invariant `Cospan::new` only checks under `debug_assert!`.
+/// [`StoreError::Corrupt`] if any leg index is out of bounds for the apex.
 fn canonical_classes(
     dom_leg: &[usize],
     cod_leg: &[usize],
@@ -312,9 +312,8 @@ impl CospanRecord {
     ///    cheapest check that fully decides tampering of the leg or apex
     ///    columns, so it runs before anything interprets them.
     /// 3. **Bounds.** Every leg entry must be a non-negative index inside the
-    ///    apex. This is the check `Cospan::new` only makes under
-    ///    `debug_assert!`, and skipping it would mean a release build panics
-    ///    later instead of erroring here.
+    ///    apex. The column is a signed integer read off disk, so neither half
+    ///    of that holds by construction.
     /// 4. **Labels.** Each apex label is decoded — and then **re-encoded and
     ///    compared against the stored string**. Decoding alone is not enough:
     ///    `decode` may accept non-canonical spellings (`usize::decode` accepts
@@ -379,7 +378,9 @@ impl CospanRecord {
         // The stored strings are reusable here precisely because step 4 pinned
         // each one as the canonical spelling of its label.
         let derived = derive(&left, &right, &self.apex)?;
-        let cospan = Cospan::new(left, right, middle);
+        let cospan = Cospan::new(left, right, middle).map_err(|error| {
+            corrupt(&format!("the stored presentation is not a cospan: {error}"))
+        })?;
 
         expect_column("dom_len", self.dom_len, derived.dom_len)?;
         expect_column("cod_len", self.cod_len, derived.cod_len)?;
@@ -420,12 +421,12 @@ fn derive(dom_leg: &[usize], cod_leg: &[usize], apex: &[String]) -> Result<Deriv
 
 /// Encode a cospan into the record that will be stored.
 ///
-/// # What this refuses, and why
+/// # What this refuses
 ///
-/// A cospan whose legs point outside its apex. `Cospan::new` accepts one in a
-/// release build (its bounds check is a `debug_assert!`), so this store is where
-/// such a value is caught — writing it would put a document on disk that no
-/// loader could safely interpret.
+/// A cospan whose legs point outside its apex. `Cospan::new` rejects one in
+/// every build profile; `Cospan::new_unchecked` and
+/// `Cospan::add_boundary_node_unchecked` accept one in a release build, and
+/// this is where a value built through either is caught.
 ///
 /// # Errors
 ///
@@ -554,23 +555,21 @@ fn corrupt(detail: &str) -> StoreError {
 
 #[cfg(test)]
 mod tests {
-    use either::Either::Left;
-
     use super::*;
 
     /// `id₂`, with each wire on its own apex vertex.
     fn id2() -> Cospan<usize> {
-        Cospan::new(vec![0, 1], vec![0, 1], vec![7, 7])
+        Cospan::new(vec![0, 1], vec![0, 1], vec![7, 7]).expect("id₂'s legs are in bounds")
     }
 
     /// The same morphism with the apex vertices swapped.
     fn id2_swapped() -> Cospan<usize> {
-        Cospan::new(vec![1, 0], vec![1, 0], vec![7, 7])
+        Cospan::new(vec![1, 0], vec![1, 0], vec![7, 7]).expect("id₂'s legs are in bounds")
     }
 
     /// The braid on two wires — a genuinely different morphism.
     fn braid() -> Cospan<usize> {
-        Cospan::new(vec![0, 1], vec![1, 0], vec![7, 7])
+        Cospan::new(vec![0, 1], vec![1, 0], vec![7, 7]).expect("the braid's legs are in bounds")
     }
 
     #[test]
@@ -584,7 +583,7 @@ mod tests {
     fn derived_columns_describe_the_cospan() {
         // μ-shape: two domain wires and one codomain wire, all on one apex
         // vertex, plus a spare vertex nobody touches — a scalar.
-        let mu = Cospan::new(vec![0, 0], vec![0], vec![3usize, 9]);
+        let mu = Cospan::new(vec![0, 0], vec![0], vec![3usize, 9]).expect("μ's legs are in bounds");
         let record = encode(&mu).expect("a well-formed cospan encodes");
         assert_eq!(record.codec(), COSPAN_CODEC);
         assert_eq!(record.dom_len(), 2);
@@ -598,10 +597,11 @@ mod tests {
 
     #[test]
     fn a_record_round_trips_through_revalidation() {
-        let cospan = Cospan::new(vec![0, 0], vec![1], vec![3usize, 9]);
+        let cospan =
+            Cospan::new(vec![0, 0], vec![1], vec![3usize, 9]).expect("the legs are in bounds");
         let record = encode(&cospan).expect("a well-formed cospan encodes");
         let loaded: Cospan<usize> = record.revalidate().expect("its own encoding revalidates");
-        assert!(loaded.structurally_equal(&cospan));
+        assert_eq!(loaded, cospan);
     }
 
     /// The presentation is what the address identifies, so an apex reordering is
@@ -626,9 +626,9 @@ mod tests {
     /// morphism from `k - 1`.
     #[test]
     fn scalars_are_counted_not_collapsed() {
-        let none = Cospan::<usize>::new(vec![], vec![], vec![]);
-        let one = Cospan::new(vec![], vec![], vec![1usize]);
-        let two = Cospan::new(vec![], vec![], vec![1usize, 1]);
+        let none = Cospan::<usize>::new(vec![], vec![], vec![]).expect("no legs to check");
+        let one = Cospan::new(vec![], vec![], vec![1usize]).expect("no legs to check");
+        let two = Cospan::new(vec![], vec![], vec![1usize, 1]).expect("no legs to check");
 
         let keys: Vec<String> = [&none, &one, &two]
             .into_iter()
@@ -646,8 +646,8 @@ mod tests {
     /// labels is not the same cospan.
     #[test]
     fn labels_separate_keys() {
-        let a = Cospan::new(vec![0], vec![0], vec![1usize]);
-        let b = Cospan::new(vec![0], vec![0], vec![2usize]);
+        let a = Cospan::new(vec![0], vec![0], vec![1usize]).expect("the legs are in bounds");
+        let b = Cospan::new(vec![0], vec![0], vec![2usize]).expect("the legs are in bounds");
         assert_ne!(
             canon_key(&a).expect("a has a key"),
             canon_key(&b).expect("b has a key")
@@ -662,9 +662,9 @@ mod tests {
             id2(),
             id2_swapped(),
             braid(),
-            Cospan::new(vec![0, 0], vec![0], vec![3usize, 9]),
-            Cospan::new(vec![], vec![], vec![1usize, 1, 2]),
-            Cospan::<usize>::new(vec![], vec![], vec![]),
+            Cospan::new(vec![0, 0], vec![0], vec![3usize, 9]).expect("μ's legs are in bounds"),
+            Cospan::new(vec![], vec![], vec![1usize, 1, 2]).expect("no legs to check"),
+            Cospan::<usize>::new(vec![], vec![], vec![]).expect("no legs to check"),
         ];
         for cospan in &samples {
             let record = encode(cospan).expect("encodes");
@@ -680,26 +680,29 @@ mod tests {
         }
     }
 
-    /// A cospan whose domain leg points outside its apex.
+    /// The release-build hole, closed on the *write* side: a value built
+    /// through `Cospan::new_unchecked` or `add_boundary_node_unchecked` must
+    /// not reach the database, because no loader could then safely interpret
+    /// it.
     ///
-    /// `Cospan::new` cannot build one here: its bounds check is a
-    /// `debug_assert!`, which does fire in a test build. `add_boundary_node`
-    /// checks nothing in *any* profile — which is exactly the hole this store
-    /// closes, and the only way to exhibit it.
-    fn leg_out_of_bounds() -> Cospan<usize> {
-        let mut cospan = Cospan::new(vec![], vec![], vec![1usize]);
-        cospan.add_boundary_node(Left(Left(5)));
-        cospan
-    }
-
-    /// The release-build hole, closed on the *write* side: a value no
-    /// constructor rejected must not reach the database, because no loader
-    /// could then safely interpret it.
+    /// Driven through [`encode`]'s two bounds checks rather than through
+    /// `encode` itself: both unchecked constructors `debug_assert!`, so a test
+    /// build cannot assemble the out-of-bounds `Cospan` that would carry the
+    /// value in.
     #[test]
-    fn an_out_of_bounds_leg_is_refused_at_encode() {
-        let err = encode(&leg_out_of_bounds())
-            .expect_err("a leg pointing outside the apex must not be written");
-        assert!(matches!(err, StoreError::Corrupt { .. }), "{err}");
+    fn an_out_of_bounds_leg_is_refused_on_the_write_path() {
+        let apex = vec!["1".to_owned()];
+
+        let narrowing = from_leg(Side::Domain, &[5], apex.len())
+            .expect_err("a leg pointing outside the apex must not become a column");
+        assert!(
+            matches!(narrowing, StoreError::Corrupt { .. }),
+            "{narrowing}"
+        );
+
+        let classes = canonical_classes(&[5], &[], &apex)
+            .expect_err("a leg pointing outside the apex has no canonical class");
+        assert!(matches!(classes, StoreError::Corrupt { .. }), "{classes}");
     }
 
     /// A record's columns, so a test can change exactly one and rebuild.
@@ -763,8 +766,8 @@ mod tests {
     /// column.
     #[test]
     fn an_out_of_bounds_leg_is_refused_on_load() {
-        let record = encode(&Cospan::new(vec![0], vec![0], vec![1usize]))
-            .expect("the well-formed original encodes");
+        let original = Cospan::new(vec![0], vec![0], vec![1usize]).expect("the legs are in bounds");
+        let record = encode(&original).expect("the well-formed original encodes");
         let mut columns = Columns::of(&record);
         columns.dom_leg = vec![5];
         let err = columns
@@ -791,7 +794,8 @@ mod tests {
     /// spelling's `canon_key` under a different address.
     #[test]
     fn a_non_canonical_label_spelling_is_corrupt() {
-        let record = encode(&Cospan::new(vec![0], vec![0], vec![7usize])).expect("encodes");
+        let original = Cospan::new(vec![0], vec![0], vec![7usize]).expect("the legs are in bounds");
+        let record = encode(&original).expect("encodes");
         let mut columns = Columns::of(&record);
         columns.apex = vec!["007".to_owned()];
         match columns.refile().build().revalidate::<usize>() {

@@ -147,11 +147,12 @@ proptest asserts the equivalence in **both** directions against
 would refuse a genuinely new one; equal morphisms must mean equal keys, or the
 store would hold duplicates it promised not to.
 
-One more guard exists because catgraph cannot provide it: `Cospan::new`
-bounds-checks legs against the apex under `debug_assert!` only, so a release
-build accepts an out-of-bounds leg and defers the failure to a panic somewhere
-else. This store bounds-checks on both sides — on write, so such a value never
-reaches disk, and on load, where it arrives as a tampered column.
+One more guard sits on both sides of the store. `Cospan::new` bounds-checks
+legs against the apex in every build profile, but `Cospan::new_unchecked` and
+`Cospan::add_boundary_node_unchecked` check only under `debug_assert!`, so a
+release build accepts an out-of-bounds leg through either. This store
+bounds-checks on write, so such a value never reaches disk, and on load, where
+it arrives as a tampered column.
 
 ## Weights
 
@@ -196,12 +197,10 @@ be persisted: two runs measured under different weightings produce numbers that
 look comparable and are not. A run that did not say which weighting produced its
 numbers has recorded numbers nobody can read.
 
-What the store cannot do yet is *replay* a trace. The step type has no public
-constructor and no serde representation at catgraph v0.11.0, so a stored step
-cannot become the value `replay` accepts. The steps persist today and are
-readable and comparable; re-deriving the endpoint from them needs an upstream
-surface that does not exist. The `replayable` column is where that lands — `false`
-on everything this build writes, and flippable without a schema migration.
+What the store does not do yet is *replay* a trace. The steps persist today and
+are readable and comparable; turning them back into the values `replay` accepts
+is not wired here. The `replayable` column is where that lands — `false` on
+everything this build writes, and flippable without a schema migration.
 
 The `derives` edge is a `TYPE RELATION` table whose record id is the digest of
 the tuple it represents: parent, child, and the run that derived one from the

@@ -28,13 +28,11 @@
 //!
 //! # There is no trusting read path
 //!
-//! [`CospanStore::get`] revalidates every document it loads. `Cospan::new`
-//! validates leg bounds under `debug_assert!` only, so a release build handed a
-//! corrupt row would accept it and defer the failure to a panic somewhere else
-//! entirely. Loading bounds-checks explicitly, decodes every label, and
-//! re-derives every derived column — including the canonical key, which is the
-//! one column whose corruption would make a key lookup claim two unequal
-//! morphisms are equal.
+//! [`CospanStore::get`] revalidates every document it loads: it bounds-checks
+//! both legs against the apex, decodes every label, rebuilds the value through
+//! the validated `Cospan::new`, and re-derives every derived column — including
+//! the canonical key, which is the one column whose corruption would make a key
+//! lookup claim two unequal morphisms are equal.
 //!
 //! # A store value implies a verified schema
 //!

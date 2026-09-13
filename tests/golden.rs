@@ -89,7 +89,8 @@ fn term_identity_is_pinned_to_exact_bytes() {
 fn cospan_identity_is_pinned_to_exact_bytes() {
     // μ-shape with a scalar: two domain wires onto one apex vertex, one
     // codomain wire, one untouched vertex.
-    let fixture = Cospan::new(vec![0, 0], vec![0], vec![3usize, 9]);
+    let fixture =
+        Cospan::new(vec![0, 0], vec![0], vec![3usize, 9]).expect("μ's legs are in bounds");
     let record = cospan::encode(&fixture).expect("the fixture encodes");
     assert_eq!(record.codec(), "cgc1");
     assert_eq!(

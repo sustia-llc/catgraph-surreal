@@ -551,8 +551,8 @@ dependencies = [
 
 [[package]]
 name = "catgraph"
-version = "0.11.0"
-source = "git+https://github.com/sustia-llc/catgraph?tag=v0.11.0#b94a390fb385c7ededb1c8eec6a1d4cf1fbaedc0"
+version = "0.23.0"
+source = "git+https://github.com/sustia-llc/catgraph?tag=v0.23.0#c1859e6db4f2f013c7daaad64ca16ef1fdf870c4"
 dependencies = [
  "either",
  "itertools 0.15.0",
@@ -565,8 +565,8 @@ dependencies = [
 
 [[package]]
 name = "catgraph-applied"
-version = "0.11.0"
-source = "git+https://github.com/sustia-llc/catgraph?tag=v0.11.0#b94a390fb385c7ededb1c8eec6a1d4cf1fbaedc0"
+version = "0.23.0"
+source = "git+https://github.com/sustia-llc/catgraph?tag=v0.23.0#c1859e6db4f2f013c7daaad64ca16ef1fdf870c4"
 dependencies = [
  "catgraph",
  "either",
@@ -582,8 +582,8 @@ dependencies = [
 
 [[package]]
 name = "catgraph-dl"
-version = "0.11.0"
-source = "git+https://github.com/sustia-llc/catgraph?tag=v0.11.0#b94a390fb385c7ededb1c8eec6a1d4cf1fbaedc0"
+version = "0.23.0"
+source = "git+https://github.com/sustia-llc/catgraph?tag=v0.23.0#c1859e6db4f2f013c7daaad64ca16ef1fdf870c4"
 dependencies = [
  "catgraph-applied",
  "thiserror 2.0.20",
@@ -591,14 +591,13 @@ dependencies = [
 
 [[package]]
 name = "catgraph-surreal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "catgraph",
  "catgraph-applied",
  "catgraph-dl",
  "catgraph-syntax",
- "either",
  "futures",
  "proptest",
  "serde",
@@ -611,8 +610,8 @@ dependencies = [
 
 [[package]]
 name = "catgraph-syntax"
-version = "0.11.0"
-source = "git+https://github.com/sustia-llc/catgraph?tag=v0.11.0#b94a390fb385c7ededb1c8eec6a1d4cf1fbaedc0"
+version = "0.23.0"
+source = "git+https://github.com/sustia-llc/catgraph?tag=v0.23.0#c1859e6db4f2f013c7daaad64ca16ef1fdf870c4"
 dependencies = [
  "catgraph",
  "catgraph-applied",
@@ -4182,7 +4181,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

@@ -9,14 +9,11 @@
 //! keeps it in that spirit: the step rows are the engine's own indices,
 //! unmodified.
 //!
-//! What the store cannot do yet is replay one. `RewriteStep` has no public
-//! constructor and no serde representation at catgraph v0.11.0, so a trace read
-//! back out of the database cannot be turned into the values `replay` accepts.
-//! The steps persist today and are readable and comparable; re-deriving the
-//! endpoint from them needs an upstream surface that does not exist. The
-//! `replayable` column is where that lands: it is `false` on everything this
-//! build writes, and the day the surface exists new runs record `true` without a
-//! schema migration.
+//! What the store does not do yet is replay one. The steps persist today and
+//! are readable and comparable; turning them back into the values `replay`
+//! accepts is not wired here. The `replayable` column is where that lands: it
+//! is `false` on everything this build writes, and wiring the reconstruction
+//! lets new runs record `true` without a schema migration.
 //!
 //! # `cost_model` is mandatory, and the reason is arithmetic
 //!
@@ -39,9 +36,9 @@
 //! instead of at the boundary, or not fail at all and match on label equality
 //! where it should not have matched.
 //!
-//! Its rejections arrive as `CatgraphError::Presentation` and are surfaced
-//! unchanged as [`StoreError::Catgraph`], because upstream's message names the
-//! violated condition and nothing here can say it better.
+//! Its rejections arrive as `CatgraphError::Rewrite(RewriteRejection)` and are
+//! surfaced unchanged as [`StoreError::Catgraph`], because upstream's message
+//! names the violated condition and nothing here can say it better.
 //!
 //! # Integers cross the boundary checked
 //!
@@ -437,10 +434,8 @@ impl RunRecord {
 
     /// Whether this trace can be replayed on load.
     ///
-    /// Always `false` for anything this build wrote, because replaying a trace
-    /// needs an upstream surface that does not exist at catgraph v0.11.0: the
-    /// step type has no public constructor and no serde representation, so a
-    /// stored step cannot become the value `replay` accepts.
+    /// Always `false` for anything this build wrote: reconstructing the values
+    /// `replay` accepts from the stored step rows is not wired here.
     ///
     /// It is deliberately **not** part of the run's content address. The flag
     /// describes what a *reader* can do with the trace, not what the run was, so
