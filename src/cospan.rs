@@ -51,11 +51,15 @@
 //! `Cospan::new` checks both legs against the apex in every build profile.
 //! `Cospan::new_unchecked` and `Cospan::add_boundary_node_unchecked` check only
 //! under `debug_assert!`, so a release build accepts an out-of-bounds leg
-//! through either and defers its failure to whatever indexes it later. Both
-//! [`encode`] and [`CospanRecord::revalidate`] therefore bounds-check
-//! explicitly and report [`StoreError::Corrupt`]: the write side covers a value
-//! that reached this store through an unchecked constructor, the load side a
-//! column that arrives off disk.
+//! through either and defers its failure to whatever indexes it later.
+//!
+//! The class derivation covers that. `canonical_classes` indexes the apex by
+//! every entry of both legs, so a leg entry at or past the apex length is
+//! [`StoreError::Corrupt`] — and both [`encode`] and
+//! [`CospanRecord::revalidate`] derive the classes: the write side for a value
+//! that reached this store through an unchecked constructor, the load side for
+//! a column that arrives off disk, where rebuilding through `Cospan::new`
+//! checks the same thing again.
 
 use catgraph::cospan::Cospan;
 use serde::Serialize;
@@ -91,7 +95,9 @@ type Class = (String, Vec<usize>, Vec<usize>);
 ///
 /// # Errors
 ///
-/// [`StoreError::Corrupt`] if any leg index is out of bounds for the apex.
+/// [`StoreError::Corrupt`] for a leg entry at or past `apex.len()`. Every entry
+/// of both legs indexes `apex` here, so an out-of-bounds leg is refused here on
+/// the write path and on the load path alike.
 fn canonical_classes(
     dom_leg: &[usize],
     cod_leg: &[usize],
@@ -311,23 +317,26 @@ impl CospanRecord {
     ///    and compared against the record id it was filed under. It is the
     ///    cheapest check that fully decides tampering of the leg or apex
     ///    columns, so it runs before anything interprets them.
-    /// 3. **Bounds.** Every leg entry must be a non-negative index inside the
-    ///    apex. The column is a signed integer read off disk, so neither half
-    ///    of that holds by construction.
+    /// 3. **Widening.** Every leg entry must widen to an index. The column is a
+    ///    signed integer read off disk, so a negative entry is possible, and it
+    ///    is refused here; an entry at or past the apex length is refused in
+    ///    step 5.
     /// 4. **Labels.** Each apex label is decoded — and then **re-encoded and
     ///    compared against the stored string**. Decoding alone is not enough:
-    ///    `decode` may accept non-canonical spellings (`usize::decode` accepts
-    ///    `"007"`), and a decodable-but-non-canonical apex would let a forged
-    ///    presentation squat the *canonical* spelling's `canon_key` under a
-    ///    different address, breaking the two-identity discipline outright.
-    ///    Requiring `encode(decode(s)) == s` pins every stored label to its one
-    ///    canonical spelling — and it is what entitles step 5 to reuse the
-    ///    stored strings instead of re-encoding.
+    ///    [`LabelCodec::decode`] is free to accept non-canonical spellings, and
+    ///    a decodable-but-non-canonical apex would let a forged presentation
+    ///    squat the *canonical* spelling's `canon_key` under a different
+    ///    address, breaking the two-identity discipline outright. Requiring
+    ///    `encode(decode(s)) == s` pins every stored label to its one canonical
+    ///    spelling — and it is what entitles step 5 to reuse the stored strings
+    ///    instead of re-encoding.
     /// 5. **Derived columns.** The sizes, the scalar count, and the canonical
-    ///    key are all re-derived from the validated presentation and compared.
-    ///    A hand-edited `canon_key` in particular must be caught: it is
-    ///    `UNIQUE` and complete, so a corrupted one would make a key lookup
-    ///    claim two unequal morphisms are equal.
+    ///    key are all re-derived from the presentation and compared, and the
+    ///    class derivation they are computed from is where a leg entry at or
+    ///    past the apex length is refused. A hand-edited `canon_key` in
+    ///    particular must be caught: it is `UNIQUE` and complete, so a
+    ///    corrupted one would make a key lookup claim two unequal morphisms are
+    ///    equal.
     ///
     /// # Errors
     ///
@@ -350,9 +359,8 @@ impl CospanRecord {
             )));
         }
 
-        let apex_len = self.apex.len();
-        let left = to_leg(Side::Domain, &self.dom_leg, apex_len)?;
-        let right = to_leg(Side::Codomain, &self.cod_leg, apex_len)?;
+        let left = to_leg(Side::Domain, &self.dom_leg)?;
+        let right = to_leg(Side::Codomain, &self.cod_leg)?;
 
         let middle = self
             .apex
@@ -423,10 +431,11 @@ fn derive(dom_leg: &[usize], cod_leg: &[usize], apex: &[String]) -> Result<Deriv
 ///
 /// # What this refuses
 ///
-/// A cospan whose legs point outside its apex. `Cospan::new` rejects one in
-/// every build profile; `Cospan::new_unchecked` and
-/// `Cospan::add_boundary_node_unchecked` accept one in a release build, and
-/// this is where a value built through either is caught.
+/// A cospan whose legs point outside its apex, whatever constructor built it.
+/// `Cospan::new` rejects one in every build profile; `Cospan::new_unchecked`
+/// and `Cospan::add_boundary_node_unchecked` accept one in a release build, and
+/// deriving the canonical classes here is what catches a value built through
+/// either.
 ///
 /// # Errors
 ///
@@ -434,9 +443,8 @@ fn derive(dom_leg: &[usize], cod_leg: &[usize], apex: &[String]) -> Result<Deriv
 /// the encoding fails, and [`StoreError::TypeMismatch`] in the theoretical case
 /// of a size too large for the database's integer column.
 pub fn encode<L: LabelCodec>(cospan: &Cospan<L>) -> Result<CospanRecord> {
-    let apex_len = cospan.middle().len();
-    let dom_leg = from_leg(Side::Domain, cospan.left_to_middle(), apex_len)?;
-    let cod_leg = from_leg(Side::Codomain, cospan.right_to_middle(), apex_len)?;
+    let dom_leg = from_leg(Side::Domain, cospan.left_to_middle())?;
+    let cod_leg = from_leg(Side::Codomain, cospan.right_to_middle())?;
     // Encoded exactly once; `derive` reuses these strings.
     let apex = encoded_apex(cospan);
 
@@ -488,35 +496,27 @@ pub fn address_of(dom_leg: &[i64], cod_leg: &[i64], apex: &[String]) -> Result<C
     CospanAddr::parse(&key).ok_or_else(|| corrupt(&format!("`{key}` is not a well-formed address")))
 }
 
-/// Narrow an in-memory leg into the database's integer lane, bounds-checking as
-/// it goes.
-fn from_leg(side: Side, leg: &[usize], apex_len: usize) -> Result<Vec<i64>> {
+/// Narrow an in-memory leg into the database's integer lane.
+fn from_leg(side: Side, leg: &[usize]) -> Result<Vec<i64>> {
     leg.iter()
-        .enumerate()
-        .map(|(boundary, &apex)| {
-            if apex >= apex_len {
-                return Err(out_of_bounds(side, boundary, apex, apex_len));
-            }
-            to_column(side.as_str(), apex)
-        })
+        .map(|&apex| to_column(side.as_str(), apex))
         .collect()
 }
 
-/// Widen a stored leg back into indices, bounds-checking as it goes.
-fn to_leg(side: Side, leg: &[i64], apex_len: usize) -> Result<Vec<usize>> {
+/// Widen a stored leg back into indices.
+///
+/// A leg entry off disk is a signed integer, so it can be negative; an entry at
+/// or past the apex length is left to the class derivation.
+fn to_leg(side: Side, leg: &[i64]) -> Result<Vec<usize>> {
     leg.iter()
         .enumerate()
         .map(|(boundary, &apex)| {
-            let apex = usize::try_from(apex).map_err(|_| {
+            usize::try_from(apex).map_err(|_| {
                 corrupt(&format!(
                     "{} leg maps boundary node {boundary} to {apex}, which is not an index",
                     side.as_str()
                 ))
-            })?;
-            if apex >= apex_len {
-                return Err(out_of_bounds(side, boundary, apex, apex_len));
-            }
-            Ok(apex)
+            })
         })
         .collect()
 }
@@ -680,25 +680,25 @@ mod tests {
         }
     }
 
-    /// [`encode`]'s two bounds checks, `from_leg` and `canonical_classes`, each
-    /// refuse a leg index at or past the apex length with
-    /// [`StoreError::Corrupt`]. Called directly: the unchecked upstream
-    /// constructors `debug_assert!`, so a test build cannot assemble the
-    /// out-of-bounds `Cospan` that would reach `encode` itself.
+    /// [`encode`] refuses a leg index at or past the apex length with
+    /// [`StoreError::Corrupt`], driven end to end rather than through the
+    /// helper that finds it.
+    ///
+    /// `Cospan::new_unchecked` is what builds the value, and it `debug_assert!`s
+    /// the leg bounds; `Cargo.toml` turns `debug-assertions` off for the
+    /// `catgraph` package in the test profile so this fixture exists.
     #[test]
     fn an_out_of_bounds_leg_is_refused_on_the_write_path() {
-        let apex = vec!["1".to_owned()];
-
-        let narrowing = from_leg(Side::Domain, &[5], apex.len())
-            .expect_err("a leg pointing outside the apex must not become a column");
-        assert!(
-            matches!(narrowing, StoreError::Corrupt { .. }),
-            "{narrowing}"
-        );
-
-        let classes = canonical_classes(&[5], &[], &apex)
-            .expect_err("a leg pointing outside the apex has no canonical class");
-        assert!(matches!(classes, StoreError::Corrupt { .. }), "{classes}");
+        let out_of_bounds = Cospan::new_unchecked(vec![5], vec![], vec![1usize]);
+        let err = encode(&out_of_bounds)
+            .expect_err("a leg pointing outside the apex must not become a record");
+        match err {
+            StoreError::Corrupt { detail, .. } => {
+                assert!(detail.contains("apex index 5"), "{detail}");
+                assert!(detail.contains("1 vertices"), "{detail}");
+            }
+            other => panic!("expected an out-of-bounds corruption, got {other:?}"),
+        }
     }
 
     /// A record's columns, so a test can change exactly one and rebuild.
@@ -785,20 +785,58 @@ mod tests {
         }
     }
 
+    /// A label type whose `decode` accepts spellings its `encode` never
+    /// produces. The integer codecs refuse those outright, so a lenient codec is
+    /// what the store's own canonical-spelling comparison ranges over.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    struct Lenient(usize);
+
+    impl LabelCodec for Lenient {
+        fn encode(&self) -> String {
+            self.0.to_string()
+        }
+
+        fn decode(raw: &str) -> Option<Self> {
+            raw.parse().ok().map(Self)
+        }
+    }
+
     /// A spelling that decodes but does not re-encode to itself is corrupt:
     /// accepting it would let a forged presentation squat the canonical
     /// spelling's `canon_key` under a different address.
     #[test]
     fn a_non_canonical_label_spelling_is_corrupt() {
+        let original =
+            Cospan::new(vec![0], vec![0], vec![Lenient(7)]).expect("the legs are in bounds");
+        let record = encode(&original).expect("encodes");
+        let mut columns = Columns::of(&record);
+        columns.apex = vec!["007".to_owned()];
+        assert_eq!(
+            Lenient::decode("007"),
+            Some(Lenient(7)),
+            "the fixture codec has to accept the spelling for the next check to be reached"
+        );
+        match columns.refile().build().revalidate::<Lenient>() {
+            Err(StoreError::Corrupt { detail, .. }) => {
+                assert!(detail.contains("non-canonical"), "{detail}");
+            }
+            other => panic!("expected a non-canonical-spelling rejection, got {other:?}"),
+        }
+    }
+
+    /// And at an integer label, where `decode` refuses the spelling one stage
+    /// earlier — the same forgery, refused for a different stated reason.
+    #[test]
+    fn a_zero_padded_integer_label_is_corrupt() {
         let original = Cospan::new(vec![0], vec![0], vec![7usize]).expect("the legs are in bounds");
         let record = encode(&original).expect("encodes");
         let mut columns = Columns::of(&record);
         columns.apex = vec!["007".to_owned()];
         match columns.refile().build().revalidate::<usize>() {
             Err(StoreError::Corrupt { detail, .. }) => {
-                assert!(detail.contains("non-canonical"), "{detail}");
+                assert!(detail.contains("`007`"), "{detail}");
             }
-            other => panic!("expected a non-canonical-spelling rejection, got {other:?}"),
+            other => panic!("expected `007` to be refused, got {other:?}"),
         }
     }
 

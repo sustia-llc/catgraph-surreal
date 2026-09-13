@@ -108,3 +108,10 @@ tempfile = "3"
 # the extension trait. The crate itself never polls it, which is the design —
 # the caller owns the loop.
 futures = "0.3"
+
+# Turns catgraph's `debug_assert!`s off in the test profile. That is what lets a
+# test build an out-of-bounds `Cospan` through `Cospan::new_unchecked` — which
+# `debug_assert!`s the leg bounds — and drive it into `cospan::encode`, where
+# this store's own refusal is the thing under test.
+[profile.test.package.catgraph]
+debug-assertions = false

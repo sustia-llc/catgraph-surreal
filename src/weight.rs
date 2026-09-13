@@ -242,8 +242,8 @@ impl WeightRecord {
             });
         }
 
-        let coordinates = decode_coordinates(&self.coordinates);
-        let finite = all_finite(&coordinates);
+        let module = RModule::new(decode_coordinates(&self.coordinates));
+        let finite = module.is_finite();
         if finite != self.finite {
             return Err(corrupt(&format!(
                 "stored `finite` is {}, but the coordinates are {}finite",
@@ -252,7 +252,7 @@ impl WeightRecord {
             )));
         }
 
-        Ok(RModule::new(coordinates))
+        Ok(module)
     }
 }
 
@@ -272,7 +272,7 @@ pub fn encode(genome: &str, gen_key: &str, weights: &RModule<f64>) -> Result<Wei
         gen_key: gen_key.to_owned(),
         dim: to_column("dim", weights.dim())?,
         coordinates: encode_coordinates(coordinates),
-        finite: all_finite(coordinates),
+        finite: weights.is_finite(),
     })
 }
 
@@ -297,12 +297,6 @@ fn decode_coordinates(bytes: &[u8]) -> Vec<f64> {
         .iter()
         .map(|word| f64::from_le_bytes(*word))
         .collect()
-}
-
-/// Whether every coordinate is finite. Vacuously true for the zero-dimensional
-/// module.
-fn all_finite(coordinates: &[f64]) -> bool {
-    coordinates.iter().all(|c| c.is_finite())
 }
 
 /// Narrow a dimension into the database's integer lane.

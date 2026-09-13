@@ -558,11 +558,14 @@ async fn a_row_whose_leg_points_outside_the_apex_is_rejected() {
     expect_corrupt(load_raw("cospan_corrupt_bounds", refile(row)).await);
 }
 
-/// A decodable-but-non-canonical label spelling is corrupt, not accepted:
-/// `usize::decode` happily parses `"007"`, and a forged row spelled that way —
-/// filed under its own (different) address but carrying the *canonical*
-/// spelling's `canon_key` — would otherwise squat the honest morphism's unique
-/// key while the two-identity discipline reads all green.
+/// A non-canonical label spelling is corrupt, not accepted: a forged row
+/// spelled `"007"` — filed under its own (different) address but carrying the
+/// *canonical* spelling's `canon_key` — would otherwise squat the honest
+/// morphism's unique key while the two-identity discipline reads all green.
+///
+/// `usize::decode` refuses the spelling outright. A `LabelCodec` that accepted
+/// it would be stopped one stage later, by the store's re-encode comparison —
+/// which `src/cospan.rs` pins over a deliberately lenient codec.
 #[tokio::test]
 async fn a_non_canonical_label_spelling_is_rejected_on_load() {
     let mut row = good_row();
@@ -571,9 +574,9 @@ async fn a_non_canonical_label_spelling_is_rejected_on_load() {
     let result = load_raw("cospan_squat_load", refile(row)).await;
     match result {
         Err(StoreError::Corrupt { detail, .. }) => {
-            assert!(detail.contains("non-canonical"), "{detail}");
+            assert!(detail.contains("`007`"), "{detail}");
         }
-        other => panic!("expected a non-canonical-spelling rejection, got {other:?}"),
+        other => panic!("expected the forged spelling to be refused, got {other:?}"),
     }
 }
 
