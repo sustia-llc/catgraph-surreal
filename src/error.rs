@@ -171,12 +171,10 @@ pub enum StoreError {
         detail: String,
     },
 
-    /// A stored document violates an invariant no constructor saw.
-    ///
-    /// Columns read off disk reach the store as plain integers and strings, so
-    /// leg bounds, derived sizes, and content addresses all hold only by
-    /// re-derivation. The store checks each on load and reports this rather
-    /// than handing an interpreter a value that panics later.
+    /// A value violates an invariant no constructor checked: on load, a
+    /// column read off disk (leg bounds, derived sizes, content addresses hold
+    /// only by re-derivation); on write, a cospan leg pointing outside its
+    /// apex. Reported rather than handed to an interpreter that panics later.
     #[error("corrupt document in {context}: {detail}")]
     Corrupt {
         /// The structure or record the corruption was found in.

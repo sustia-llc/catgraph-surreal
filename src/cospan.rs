@@ -680,15 +680,11 @@ mod tests {
         }
     }
 
-    /// The release-build hole, closed on the *write* side: a value built
-    /// through `Cospan::new_unchecked` or `add_boundary_node_unchecked` must
-    /// not reach the database, because no loader could then safely interpret
-    /// it.
-    ///
-    /// Driven through [`encode`]'s two bounds checks rather than through
-    /// `encode` itself: both unchecked constructors `debug_assert!`, so a test
-    /// build cannot assemble the out-of-bounds `Cospan` that would carry the
-    /// value in.
+    /// [`encode`]'s two bounds checks, `from_leg` and `canonical_classes`, each
+    /// refuse a leg index at or past the apex length with
+    /// [`StoreError::Corrupt`]. Called directly: the unchecked upstream
+    /// constructors `debug_assert!`, so a test build cannot assemble the
+    /// out-of-bounds `Cospan` that would reach `encode` itself.
     #[test]
     fn an_out_of_bounds_leg_is_refused_on_the_write_path() {
         let apex = vec!["1".to_owned()];
