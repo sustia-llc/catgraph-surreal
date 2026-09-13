@@ -505,8 +505,13 @@ async fn recording_the_same_run_twice_is_idempotent() {
 
 /// `replayable` is `READONLY` and outside the run's content address, so a row
 /// stored with `false` under it is a row re-recording the same run has to
-/// write `true` over. That refusal is absorbed: the call succeeds, and the
-/// stored flag stands.
+/// write `true` over. The refused write is retried with `false`: the call
+/// succeeds and the stored flag stands.
+///
+/// **And both halves of the transaction land.** The edge is deleted before the
+/// re-record, so a retry that rolled back — or a refusal absorbed without one —
+/// leaves the run reachable in the table and unreachable in the graph, which is
+/// what `edges_of_run` is read for here.
 #[tokio::test]
 async fn recording_a_run_over_a_row_that_is_not_replayable_is_idempotent() {
     let (store, lineage) = bootstrapped("lineage_run_replayable_false").await;
@@ -530,11 +535,38 @@ async fn recording_a_run_over_a_row_that_is_not_replayable_is_idempotent() {
         .check()
         .expect("and is accepted under OPTION IMPORT");
 
+    store
+        .client()
+        .query(format!("DELETE {}", schema::DERIVES_TABLE))
+        .await
+        .expect("the delete runs")
+        .check()
+        .expect("and the edge is gone");
+    assert_eq!(
+        lineage
+            .edges_of_run(&run)
+            .await
+            .expect("reading the edges")
+            .len(),
+        0,
+        "the deleted edge has to be gone, or the assertion below passes vacuously"
+    );
+
     let again = lineage
         .record_run(&rule_set, &start, &outcome, "unit")
         .await
         .expect("re-recording the same run over a row flagged false");
     assert_eq!(again, run);
+
+    assert_eq!(
+        lineage
+            .edges_of_run(&run)
+            .await
+            .expect("reading the edges")
+            .len(),
+        1,
+        "the retry's edge half has to land with its run half"
+    );
 
     let loaded = lineage
         .get_run(&run)
@@ -545,8 +577,8 @@ async fn recording_a_run_over_a_row_that_is_not_replayable_is_idempotent() {
     assert_eq!(row_count(&store, schema::REWRITE_RUN_TABLE).await, 1);
 }
 
-/// And that tolerance is one column wide: a row differing anywhere the run's
-/// content address covers is still the collision alarm.
+/// And that tolerance is `replayable` alone: a row differing in `best`, a
+/// column the run's content address covers, is the collision alarm.
 #[tokio::test]
 async fn recording_a_run_over_a_row_with_a_different_best_is_refused() {
     let (store, lineage) = bootstrapped("lineage_run_tampered_best").await;
@@ -579,6 +611,111 @@ async fn recording_a_run_over_a_row_with_a_different_best_is_refused() {
     };
     assert_eq!(table, schema::REWRITE_RUN_TABLE);
     assert_eq!(field, "best");
+}
+
+/// A column that sorts *after* `replayable`, differing alone: the row's flag
+/// still reads `true`, so the write is refused on `rule_set` and no retry runs.
+///
+/// This is the row that separates the retry's `field == "replayable"` guard
+/// from an unguarded one. A retry that fired on any read-only refusal would
+/// write `replayable = false` over this row's `true` and be refused on
+/// `replayable`, the earlier column — measured: `field` reads `"replayable"`
+/// with the guard removed, `"rule_set"` with it.
+#[tokio::test]
+async fn recording_a_run_over_a_row_with_a_different_rule_set_is_refused() {
+    let (store, lineage) = bootstrapped("lineage_run_tampered_rule_set_only").await;
+    let (rule_set, start, outcome) = a_run(&lineage).await;
+    let run = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("first write");
+
+    let planted = format!("b3_{}", "e".repeat(64));
+    assert_ne!(
+        planted,
+        rule_set.as_str(),
+        "the plant has to change the column"
+    );
+    store
+        .client()
+        .query("OPTION IMPORT; UPDATE $rid SET rule_set = $planted RETURN NONE")
+        .bind((
+            "rid",
+            RecordId::new(schema::REWRITE_RUN_TABLE, run.as_str()),
+        ))
+        .bind(("planted", planted))
+        .await
+        .expect("the edit runs")
+        .check()
+        .expect("and is accepted under OPTION IMPORT");
+
+    // The flag a retry would overwrite is untouched, which is what makes this
+    // row separate the two. Read raw: the planted `rule_set` is exactly what a
+    // revalidating read refuses.
+    let mut response = store
+        .client()
+        .query("SELECT VALUE replayable FROM $rid")
+        .bind((
+            "rid",
+            RecordId::new(schema::REWRITE_RUN_TABLE, run.as_str()),
+        ))
+        .await
+        .expect("reading the flag");
+    let flag: Option<bool> = response.take(0).expect("the column reads back");
+    assert_eq!(flag, Some(true), "the stored flag has to still be `true`");
+
+    let err = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect_err("a changed `rule_set` under one address is the alarm");
+    let StoreError::ReadOnly { table, field } = &err else {
+        panic!("expected a read-only refusal, got {err:?}");
+    };
+    assert_eq!(table, schema::REWRITE_RUN_TABLE);
+    assert_eq!(field, "rule_set");
+}
+
+/// And the alarm survives a row that *also* carries the stale flag: a row
+/// differing in `rule_set` and in `replayable` is refused on `replayable`
+/// first — the engine names the alphabetically earlier column — and the retry,
+/// writing the `false` that row already holds, surfaces `rule_set`.
+#[tokio::test]
+async fn recording_a_run_over_a_row_with_a_different_rule_set_and_a_stale_flag_is_refused() {
+    let (store, lineage) = bootstrapped("lineage_run_tampered_rule_set").await;
+    let (rule_set, start, outcome) = a_run(&lineage).await;
+    let run = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("first write");
+
+    let planted = format!("b3_{}", "e".repeat(64));
+    assert_ne!(
+        planted,
+        rule_set.as_str(),
+        "the plant has to change the column"
+    );
+    store
+        .client()
+        .query("OPTION IMPORT; UPDATE $rid SET rule_set = $planted, replayable = false RETURN NONE")
+        .bind((
+            "rid",
+            RecordId::new(schema::REWRITE_RUN_TABLE, run.as_str()),
+        ))
+        .bind(("planted", planted))
+        .await
+        .expect("the edit runs")
+        .check()
+        .expect("and is accepted under OPTION IMPORT");
+
+    let err = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect_err("a changed `rule_set` under one address is the alarm");
+    let StoreError::ReadOnly { table, field } = &err else {
+        panic!("expected a read-only refusal, got {err:?}");
+    };
+    assert_eq!(table, schema::REWRITE_RUN_TABLE);
+    assert_eq!(field, "rule_set");
 }
 
 /// Two runs that differ only in the weighting are different records, because

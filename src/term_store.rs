@@ -22,8 +22,9 @@
 //! # A store value implies a verified schema
 //!
 //! [`TermStore::open`] bootstraps and verifies before handing back a value,
-//! and the crate-private `TermStore::from_bootstrapped` requires a connection
-//! whose term schema its caller has already bootstrapped and verified. That is
+//! and the crate-private `TermStore::from_bootstrapped` leaves that to its
+//! caller, which bootstraps and verifies the term schema before the value is
+//! used or returned. That is
 //! not ceremony —
 //! a write against an undefined table would make SurrealDB auto-create it
 //! `SCHEMALESS`, and a *later* bootstrap's `DEFINE TABLE IF NOT EXISTS` would
@@ -193,10 +194,10 @@ impl<G> TermStore<G> {
         Ok(repository)
     }
 
-    /// Wrap a connection whose term schema is already bootstrapped and
-    /// verified.
+    /// Wrap a connection, leaving the term schema's bootstrap to the caller.
     ///
-    /// Unchecked: the caller carries the obligation [`Self::open`] discharges.
+    /// Unchecked: the caller bootstraps and verifies that schema before the
+    /// value is used or returned, which is what [`Self::open`] does with it.
     pub(crate) fn from_bootstrapped(store: Store) -> Self {
         Self {
             store,

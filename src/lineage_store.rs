@@ -572,8 +572,13 @@ where
     /// Recording the same run twice is a success and changes nothing — over a
     /// row holding a different `replayable` included. That column is `READONLY`
     /// and outside the run's content address, so writing this build's `true`
-    /// over a stored `false` draws a refusal naming it; the refusal is absorbed
-    /// once the stored row re-reads as this run, and the stored flag stands.
+    /// over a stored `false` draws a refusal naming it; the whole write is then
+    /// retried once with `replayable` set to `false`, which is the only value a
+    /// stored row can hold under that column that this record does not. Where
+    /// the stored row is otherwise this run, the retried run row changes no
+    /// value and the edge lands beside it in the same transaction, so a
+    /// returned address means both halves are stored on that path as on any
+    /// other.
     ///
     /// # Errors
     ///
@@ -581,10 +586,9 @@ where
     ///   fails a screen.
     /// - [`StoreError::ReadOnly`] if a *changed* trace or edge is written under
     ///   an existing address, which would mean two distinct runs had produced
-    ///   one content address. A refusal naming `replayable` alone stands only
-    ///   where the stored row is not this run.
-    /// - [`StoreError::Corrupt`] if the row a `replayable` refusal names does
-    ///   not revalidate.
+    ///   one content address. A stale `replayable` alone is retried rather than
+    ///   surfaced; a row differing in some other column too is refused on that
+    ///   column.
     /// - a database error otherwise. A transaction conflict is possible and is
     ///   retried by re-calling **this method**, not anything inside it — see
     ///   [`retry`](mod@crate::retry).
@@ -608,7 +612,7 @@ where
         // and harmless to race on.
         self.put_terms(endpoints.into()).await?;
 
-        let write = RunWrite {
+        let mut write = RunWrite {
             parent: RecordId::new(TERM_TABLE, edge.parent().as_str()),
             child: RecordId::new(TERM_TABLE, edge.child().as_str()),
             edge: RecordId::new(DERIVES_TABLE, edge.addr().as_str()),
@@ -618,52 +622,50 @@ where
                 rule_set: edge.rule_set().as_str().to_owned(),
                 cost_model: edge.cost_model().to_owned(),
             },
-            run: RunRow::from_record(record.clone()),
+            run: RunRow::from_record(record),
         };
         if let Err(error) = self
             .store
             .run_write(
                 RECORD_RUN_TABLES,
                 RECORD_RUN,
-                ("row", write),
+                ("row", write.clone()),
                 // Both tables here are write-once by construction, so a readonly
                 // refusal has two causes: `replayable`, which is outside the
                 // run's content address, so a stored row can hold a value this
                 // build does not write, and any other column, which is the
-                // alarm that two distinct runs produced one address. It is classified
-                // rather than left raw because naming the column is what tells
-                // those apart — and the *edge* shares the second fate.
+                // alarm that two distinct runs produced one address. It is
+                // classified rather than left raw because naming the column is
+                // what tells those apart — and the *edge* shares the second
+                // fate.
+                //
+                // The first cause is retried below with `replayable: false`, the
+                // stored row's only possible value under that column: the run
+                // half of the retry then writes values the row already holds,
+                // and the edge half lands in the same transaction rather than
+                // rolling back with the refusal. A row that differs in some
+                // other column too refuses the retry, naming that column.
                 Refusals::none().with_readonly_fields(&REWRITE_RUN_FIELDS),
             )
             .await
         {
-            self.absorb_replayable_refusal(&record, error).await?;
+            let StoreError::ReadOnly { table, field } = &error else {
+                return Err(error);
+            };
+            if table != REWRITE_RUN_TABLE || field != "replayable" {
+                return Err(error);
+            }
+            write.run.replayable = false;
+            self.store
+                .run_write(
+                    RECORD_RUN_TABLES,
+                    RECORD_RUN,
+                    ("row", write),
+                    Refusals::none().with_readonly_fields(&REWRITE_RUN_FIELDS),
+                )
+                .await?;
         }
         Ok(addr)
-    }
-
-    /// Absorb a readonly refusal that names `replayable`.
-    ///
-    /// Returns `Ok(())` where the stored row revalidates and equals `record` on
-    /// every other column; `error` itself for every other refusal and for a row
-    /// that disagrees.
-    async fn absorb_replayable_refusal(&self, record: &RunRecord, error: StoreError) -> Result<()> {
-        let StoreError::ReadOnly { table, field } = &error else {
-            return Err(error);
-        };
-        if table != REWRITE_RUN_TABLE || field != "replayable" {
-            return Err(error);
-        }
-        let Some(stored) = self.get_run(record.addr()).await? else {
-            return Err(error);
-        };
-        let mut expected = record.clone();
-        expected.replayable = stored.replayable();
-        if stored == expected {
-            Ok(())
-        } else {
-            Err(error)
-        }
     }
 
     /// Replay a run's trace and return the morphism it re-derives.
