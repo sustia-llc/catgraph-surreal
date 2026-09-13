@@ -301,6 +301,13 @@ impl TraceStep {
     }
 }
 
+/// The field layout `RewriteStep` deserializes from.
+#[derive(Serialize)]
+struct StepWire {
+    rule: usize,
+    matched_edges: Vec<usize>,
+}
+
 /// An optimizer run as it is stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRecord {
@@ -490,13 +497,6 @@ impl RunRecord {
     /// wire shape is therefore a coupling between the two crates, and
     /// `tests/golden.rs` pins it.
     fn rewrite_steps(&self) -> Result<Vec<RewriteStep>> {
-        /// The field layout `RewriteStep` deserializes from.
-        #[derive(Serialize)]
-        struct StepWire {
-            rule: usize,
-            matched_edges: Vec<usize>,
-        }
-
         self.steps
             .iter()
             .enumerate()
@@ -1242,8 +1242,8 @@ mod tests {
     ///
     /// `μ ; Δ ; μ ; Δ` under both rules records two *distinct* steps — rule 0 at
     /// edges `[1, 2]`, then rule 1 at `[0, 1]` — which is what makes reversing
-    /// them observable at all; the one-site fixtures record the same step twice
-    /// and reverse to themselves.
+    /// them observable at all; `an_outcome` and `a_two_rule_outcome` each record
+    /// the one step `[(0, [0, 1])]`, which reverses to itself.
     #[test]
     fn a_multi_step_trace_replays_only_in_the_recorded_order() {
         let rule_set = encode_rule_set(&[
@@ -1404,6 +1404,82 @@ mod tests {
             }))) => assert_eq!(step, Some(0)),
             other => panic!("expected a step-0 non-match under reversed rules, got {other:?}"),
         }
+    }
+
+    /// `Δ ; μ ; Δ ; μ : 1 → 1`.
+    fn copy_add_twice() -> ColoredExpr<Gen> {
+        let once = || {
+            Free::compose(Free::generator(Gen::Copy), Free::<Gen>::generator(Gen::Add))
+                .expect("Δ ; μ composes")
+        };
+        let twice = Free::compose(once(), once()).expect("Δ ; μ ; Δ ; μ composes");
+        ColoredExpr::new(vec![()], twice).expect("Δ ; μ ; Δ ; μ type-checks")
+    }
+
+    /// The other branch a reversed rule slice reaches: two rules sharing a
+    /// left-hand side both match at the recorded site, so the trace replays —
+    /// to the endpoint the *other* rule rewrites to.
+    #[test]
+    fn rules_sharing_a_left_hand_side_replay_swapped_to_a_different_endpoint() {
+        let rule_set = encode_rule_set(&[
+            (copy_then_add(), identity()),
+            (copy_then_add(), copy_add_twice()),
+        ])
+        .expect("both pairs are rules");
+        let compiled: Vec<RewriteRule<Gen>> = rule_set.revalidate().expect("revalidates");
+        let start = copy_then_add();
+        let outcome = optimize(&start, &compiled, 16, |_| 1).expect("the search runs");
+        let record = encode_run(rule_set.addr(), &start, &outcome, "unit").expect("encodes");
+        assert_eq!(
+            record.steps().len(),
+            1,
+            "the pin needs the one-step trace, got {:?}",
+            record.steps()
+        );
+        assert_eq!(
+            record.steps()[0].rule(),
+            0,
+            "the pin needs the trace to name rule 0, got {:?}",
+            record.steps()
+        );
+        record
+            .replay(&start, &compiled)
+            .expect("stored order replays");
+
+        let swapped_set = encode_rule_set(&[
+            (copy_then_add(), copy_add_twice()),
+            (copy_then_add(), identity()),
+        ])
+        .expect("the swapped pairs are rules");
+        let swapped: Vec<RewriteRule<Gen>> = swapped_set.revalidate().expect("revalidates");
+        let replayed = record
+            .replay(&start, &swapped)
+            .expect("the shared left-hand side matches at the recorded site");
+        let endpoint = term::encode(&replayed).expect("the endpoint encodes");
+        assert_ne!(
+            endpoint.addr(),
+            record.best(),
+            "swapped rules replayed to `{}`, against a stored best of `{}`",
+            endpoint.addr(),
+            record.best()
+        );
+    }
+
+    /// The mirror a stored trace crosses back through renders the same bytes as
+    /// upstream's own step, so a field renamed on either side is a failure here.
+    #[test]
+    fn the_step_wire_mirror_renders_upstreams_step_bytes() {
+        let (_rule_set, _start, outcome) = an_outcome();
+        let steps = outcome.steps();
+        assert_eq!(steps.len(), 1, "the fixture run takes one step: {steps:?}");
+        let wire = StepWire {
+            rule: steps[0].rule(),
+            matched_edges: steps[0].matched_edges().to_vec(),
+        };
+        assert_eq!(
+            serde_json::to_string(&wire).expect("the mirror serializes"),
+            serde_json::to_string(&steps[0]).expect("upstream's step serializes")
+        );
     }
 
     /// A step column off disk is a signed integer, so it can be negative — and

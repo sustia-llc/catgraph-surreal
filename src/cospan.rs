@@ -835,6 +835,9 @@ mod tests {
         match columns.refile().build().revalidate::<usize>() {
             Err(StoreError::Corrupt { detail, .. }) => {
                 assert!(detail.contains("`007`"), "{detail}");
+                // Which stage refused, not merely that one did: the
+                // canonical-spelling comparison carries `007` too.
+                assert!(detail.contains("not a label of this type"), "{detail}");
             }
             other => panic!("expected `007` to be refused, got {other:?}"),
         }

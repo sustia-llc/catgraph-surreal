@@ -89,8 +89,9 @@ macro_rules! integer_codec {
 
             /// The label this decimal spelling names, and `None` for every
             /// other string — a spelling this type parses but would never
-            /// produce (`"+1"`, `"01"`, `"-0"`) included, alongside the ones it
-            /// does not parse at all (`" 1"`, `""`, a value out of range).
+            /// produce (`"+1"`, `"01"`, and `"-0"` at the signed types)
+            /// included, alongside the ones it does not parse at all (`" 1"`,
+            /// `""`, a value out of range, and `"-0"` at the unsigned types).
             fn decode(raw: &str) -> Option<Self> {
                 raw.parse::<Self>()
                     .ok()

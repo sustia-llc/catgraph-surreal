@@ -575,6 +575,9 @@ async fn a_non_canonical_label_spelling_is_rejected_on_load() {
     match result {
         Err(StoreError::Corrupt { detail, .. }) => {
             assert!(detail.contains("`007`"), "{detail}");
+            // Which stage refused, not merely that one did: the
+            // canonical-spelling comparison carries `007` too.
+            assert!(detail.contains("not a label of this type"), "{detail}");
         }
         other => panic!("expected the forged spelling to be refused, got {other:?}"),
     }

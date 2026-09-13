@@ -366,13 +366,15 @@ impl<G> LineageStore<G> {
     ///
     /// The term table is bootstrapped too, because the derivation edge is
     /// declared `TYPE RELATION IN term OUT term` and both of its endpoints are
-    /// term records.
+    /// term records. [`Self::bootstrap`] defines and verifies it alongside the
+    /// lineage tables, and the term repository this store replays through is
+    /// built over that same pass.
     ///
     /// # Errors
     ///
     /// Fails if a schema cannot be defined or does not verify.
     pub async fn open(store: Store) -> Result<Self> {
-        let terms = TermStore::open(store.clone()).await?;
+        let terms = TermStore::from_bootstrapped(store.clone());
         let repository = Self { store, terms };
         repository.bootstrap().await?;
         Ok(repository)
@@ -567,7 +569,11 @@ where
     /// are not comparable, and a run that does not say which one it used has
     /// recorded numbers nobody can read.
     ///
-    /// Recording the same run twice is a success and changes nothing.
+    /// Recording the same run twice is a success and changes nothing — over a
+    /// row holding a different `replayable` included. That column is `READONLY`
+    /// and outside the run's content address, so writing this build's `true`
+    /// over a stored `false` draws a refusal naming it; the refusal is absorbed
+    /// once the stored row re-reads as this run, and the stored flag stands.
     ///
     /// # Errors
     ///
@@ -575,7 +581,10 @@ where
     ///   fails a screen.
     /// - [`StoreError::ReadOnly`] if a *changed* trace or edge is written under
     ///   an existing address, which would mean two distinct runs had produced
-    ///   one content address.
+    ///   one content address. A refusal naming `replayable` alone stands only
+    ///   where the stored row is not this run.
+    /// - [`StoreError::Corrupt`] if the row a `replayable` refusal names does
+    ///   not revalidate.
     /// - a database error otherwise. A transaction conflict is possible and is
     ///   retried by re-calling **this method**, not anything inside it — see
     ///   [`retry`](mod@crate::retry).
@@ -609,22 +618,52 @@ where
                 rule_set: edge.rule_set().as_str().to_owned(),
                 cost_model: edge.cost_model().to_owned(),
             },
-            run: RunRow::from_record(record),
+            run: RunRow::from_record(record.clone()),
         };
-        self.store
+        if let Err(error) = self
+            .store
             .run_write(
                 RECORD_RUN_TABLES,
                 RECORD_RUN,
                 ("row", write),
                 // Both tables here are write-once by construction, so a readonly
-                // refusal is the alarm that two distinct runs produced one
-                // address. It is classified rather than left raw because the
-                // *edge* shares that fate and naming the column is what tells
-                // the two apart.
+                // refusal has two causes: `replayable`, which is outside the
+                // run's content address, so a stored row can hold a value this
+                // build does not write, and any other column, which is the
+                // alarm that two distinct runs produced one address. It is classified
+                // rather than left raw because naming the column is what tells
+                // those apart — and the *edge* shares the second fate.
                 Refusals::none().with_readonly_fields(&REWRITE_RUN_FIELDS),
             )
-            .await?;
+            .await
+        {
+            self.absorb_replayable_refusal(&record, error).await?;
+        }
         Ok(addr)
+    }
+
+    /// Absorb a readonly refusal that names `replayable`.
+    ///
+    /// Returns `Ok(())` where the stored row revalidates and equals `record` on
+    /// every other column; `error` itself for every other refusal and for a row
+    /// that disagrees.
+    async fn absorb_replayable_refusal(&self, record: &RunRecord, error: StoreError) -> Result<()> {
+        let StoreError::ReadOnly { table, field } = &error else {
+            return Err(error);
+        };
+        if table != REWRITE_RUN_TABLE || field != "replayable" {
+            return Err(error);
+        }
+        let Some(stored) = self.get_run(record.addr()).await? else {
+            return Err(error);
+        };
+        let mut expected = record.clone();
+        expected.replayable = stored.replayable();
+        if stored == expected {
+            Ok(())
+        } else {
+            Err(error)
+        }
     }
 
     /// Replay a run's trace and return the morphism it re-derives.
