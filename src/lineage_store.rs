@@ -42,7 +42,6 @@
 //! What still refuses a *changed* edge is the `READONLY` columns: a different
 //! payload under the same tuple is a changed value, and the engine says so.
 
-use std::marker::PhantomData;
 use std::sync::LazyLock;
 
 use catgraph_applied::prop::PropSignature;
@@ -63,7 +62,7 @@ use crate::schema::{
 };
 use crate::store::Store;
 use crate::term::TermRecord;
-use crate::term_store::TermRow;
+use crate::term_store::{TermRow, TermStore};
 
 /// Write one rule set, creating it or leaving an identical row untouched.
 const PUT_RULE_SET: &str = "UPSERT $row.id CONTENT $row RETURN NONE";
@@ -343,12 +342,15 @@ from_key!(TermAddr, RuleSetAddr, RunAddr, DerivationAddr);
 
 /// Stores and loads rule sets, optimizer traces, and the derivation graph.
 ///
-/// The generator type is a phantom parameter behind a function pointer, so the
+/// The generator type is carried by the term repository this store replays
+/// through, itself a phantom parameter behind a function pointer — so the
 /// store's own auto traits do not depend on `G`.
 #[derive(Debug, Clone)]
 pub struct LineageStore<G> {
     store: Store,
-    generator: PhantomData<fn() -> G>,
+    /// A run's endpoints are terms, and replaying one starts from the term its
+    /// `start` column addresses.
+    terms: TermStore<G>,
 }
 
 impl<G> LineageStore<G> {
@@ -364,16 +366,16 @@ impl<G> LineageStore<G> {
     ///
     /// The term table is bootstrapped too, because the derivation edge is
     /// declared `TYPE RELATION IN term OUT term` and both of its endpoints are
-    /// term records.
+    /// term records. [`Self::bootstrap`] defines and verifies it alongside the
+    /// lineage tables, and the term repository this store replays through is
+    /// built over that same pass.
     ///
     /// # Errors
     ///
     /// Fails if a schema cannot be defined or does not verify.
     pub async fn open(store: Store) -> Result<Self> {
-        let repository = Self {
-            store,
-            generator: PhantomData,
-        };
+        let terms = TermStore::from_bootstrapped(store.clone());
+        let repository = Self { store, terms };
         repository.bootstrap().await?;
         Ok(repository)
     }
@@ -567,7 +569,16 @@ where
     /// are not comparable, and a run that does not say which one it used has
     /// recorded numbers nobody can read.
     ///
-    /// Recording the same run twice is a success and changes nothing.
+    /// Recording the same run twice is a success and changes nothing — over a
+    /// row holding a different `replayable` included. That column is `READONLY`
+    /// and outside the run's content address, so writing this build's `true`
+    /// over a stored `false` draws a refusal naming it; the whole write is then
+    /// retried once with `replayable` set to `false`, which is the only value a
+    /// stored row can hold under that column that this record does not. Where
+    /// the stored row is otherwise this run, the retried run row changes no
+    /// value and the edge lands beside it in the same transaction, so a
+    /// returned address means both halves are stored on that path as on any
+    /// other.
     ///
     /// # Errors
     ///
@@ -575,7 +586,9 @@ where
     ///   fails a screen.
     /// - [`StoreError::ReadOnly`] if a *changed* trace or edge is written under
     ///   an existing address, which would mean two distinct runs had produced
-    ///   one content address.
+    ///   one content address. A stale `replayable` alone is retried rather than
+    ///   surfaced; a row differing in some other column too is refused on that
+    ///   column.
     /// - a database error otherwise. A transaction conflict is possible and is
     ///   retried by re-calling **this method**, not anything inside it — see
     ///   [`retry`](mod@crate::retry).
@@ -599,7 +612,7 @@ where
         // and harmless to race on.
         self.put_terms(endpoints.into()).await?;
 
-        let write = RunWrite {
+        let mut write = RunWrite {
             parent: RecordId::new(TERM_TABLE, edge.parent().as_str()),
             child: RecordId::new(TERM_TABLE, edge.child().as_str()),
             edge: RecordId::new(DERIVES_TABLE, edge.addr().as_str()),
@@ -611,20 +624,86 @@ where
             },
             run: RunRow::from_record(record),
         };
-        self.store
+        if let Err(error) = self
+            .store
             .run_write(
                 RECORD_RUN_TABLES,
                 RECORD_RUN,
-                ("row", write),
+                ("row", write.clone()),
                 // Both tables here are write-once by construction, so a readonly
-                // refusal is the alarm that two distinct runs produced one
-                // address. It is classified rather than left raw because the
-                // *edge* shares that fate and naming the column is what tells
-                // the two apart.
+                // refusal has two causes: `replayable`, which is outside the
+                // run's content address, so a stored row can hold a value this
+                // build does not write, and any other column, which is the
+                // alarm that two distinct runs produced one address. It is
+                // classified rather than left raw because naming the column is
+                // what tells those apart — and the *edge* shares the second
+                // fate.
+                //
+                // The first cause is retried below with `replayable: false`, the
+                // stored row's only possible value under that column: the run
+                // half of the retry then writes values the row already holds,
+                // and the edge half lands in the same transaction rather than
+                // rolling back with the refusal. A row that differs in some
+                // other column too refuses the retry, naming that column.
                 Refusals::none().with_readonly_fields(&REWRITE_RUN_FIELDS),
             )
-            .await?;
+            .await
+        {
+            let StoreError::ReadOnly { table, field } = &error else {
+                return Err(error);
+            };
+            if table != REWRITE_RUN_TABLE || field != "replayable" {
+                return Err(error);
+            }
+            write.run.replayable = false;
+            self.store
+                .run_write(
+                    RECORD_RUN_TABLES,
+                    RECORD_RUN,
+                    ("row", write),
+                    Refusals::none().with_readonly_fields(&REWRITE_RUN_FIELDS),
+                )
+                .await?;
+        }
         Ok(addr)
+    }
+
+    /// Replay a run's trace and return the morphism it re-derives.
+    ///
+    /// The start term is loaded by the run's `start` address and the rules are
+    /// rebuilt from the run's rule set through `RewriteRule::new`, in the order
+    /// they were stored — which is the order a trace's rule indices are
+    /// relative to. Both are revalidated on the way, like any other load.
+    ///
+    /// The result is the endpoint the steps compose to, not a claim that it
+    /// equals the run's `best` column: a trace replayed against a start or a
+    /// rule set that is not the one it was recorded from can be a legal
+    /// derivation of something else.
+    ///
+    /// # Errors
+    ///
+    /// - [`StoreError::Corrupt`] if the run's `start` term or its rule set is
+    ///   not stored, or if a step column is not an index.
+    /// - [`StoreError::Catgraph`] if the steps are not a derivation — naming
+    ///   the step that failed.
+    /// - a database error, or a revalidation failure on either load.
+    pub async fn replay_run(&self, run: &RunRecord) -> Result<ColoredExpr<G>> {
+        let start = self
+            .terms
+            .get(run.start())
+            .await?
+            .ok_or_else(|| StoreError::Corrupt {
+                context: format!("{REWRITE_RUN_TABLE}:{}", run.addr()),
+                detail: format!("the run's `start` term `{}` is not stored", run.start()),
+            })?;
+        let rules =
+            self.get_rule_set(run.rule_set())
+                .await?
+                .ok_or_else(|| StoreError::Corrupt {
+                    context: format!("{REWRITE_RUN_TABLE}:{}", run.addr()),
+                    detail: format!("the run's rule set `{}` is not stored", run.rule_set()),
+                })?;
+        run.replay(&start, &rules)
     }
 
     /// Store the endpoint terms, in one statement.

@@ -15,12 +15,13 @@
 #![cfg(feature = "mem")]
 
 use std::borrow::Cow;
+use std::marker::PhantomData;
 
 use catgraph_applied::prop::colored::ColoredExpr;
 use catgraph_applied::prop::presentation::rewrite::{RewriteOutcome, RewriteRule, optimize};
 use catgraph_applied::prop::{Free, PropSignature};
 use catgraph_surreal::{
-    LineageStore, RuleSetAddr, Store, StoreBuilder, StoreError, lineage, schema,
+    LineageStore, RuleSetAddr, Store, StoreBuilder, StoreError, TermStore, lineage, schema,
 };
 use serde::{Deserialize, Serialize};
 use surrealdb::types::{RecordId, RecordIdKey, SurrealValue};
@@ -67,6 +68,52 @@ fn rules() -> Vec<(ColoredExpr<Gen>, ColoredExpr<Gen>)> {
     vec![(copy_then_add(), identity())]
 }
 
+/// `μ ; Δ : 2 → 2`, whose left-hand side cannot fire on `Δ ; μ`.
+fn add_then_copy() -> ColoredExpr<Gen> {
+    let expr = Free::compose(Free::generator(Gen::Add), Free::<Gen>::generator(Gen::Copy))
+        .expect("μ ; Δ composes");
+    ColoredExpr::new(vec![(), ()], expr).expect("μ ; Δ type-checks")
+}
+
+/// `id₂ : 2 → 2`.
+fn identity_two() -> ColoredExpr<Gen> {
+    ColoredExpr::new(vec![(), ()], Free::<Gen>::identity(2)).expect("id₂ type-checks")
+}
+
+/// Two rules, so that the order they are rebuilt in is observable.
+fn two_rules() -> Vec<(ColoredExpr<Gen>, ColoredExpr<Gen>)> {
+    vec![
+        (copy_then_add(), identity()),
+        (add_then_copy(), identity_two()),
+    ]
+}
+
+/// `μ ; Δ ; μ ; Δ : 2 → 2` — overlapping reducible sites for both rules.
+fn two_reducible_sites() -> ColoredExpr<Gen> {
+    let add_copy = || {
+        Free::compose(Free::generator(Gen::Add), Free::<Gen>::generator(Gen::Copy))
+            .expect("μ ; Δ composes")
+    };
+    let twice = Free::compose(add_copy(), add_copy()).expect("μ ; Δ ; μ ; Δ composes");
+    ColoredExpr::new(vec![(), ()], twice).expect("μ ; Δ ; μ ; Δ type-checks")
+}
+
+/// A signature type that is itself neither `Send` nor `Sync`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+struct NotSend(PhantomData<*const ()>);
+
+impl PropSignature for NotSend {
+    type Color = ();
+
+    fn source_word(&self) -> Cow<'_, [()]> {
+        Cow::Owned(vec![()])
+    }
+
+    fn target_word(&self) -> Cow<'_, [()]> {
+        Cow::Owned(vec![()])
+    }
+}
+
 async fn connect(database: &str) -> Store {
     StoreBuilder::new("memory")
         .namespace("catgraph_test")
@@ -99,6 +146,25 @@ async fn a_run(
         .expect("it is present");
     let start = copy_then_add();
     let outcome = optimize(&start, &compiled, 16, |_| 1).expect("the search runs");
+    (addr, start, outcome)
+}
+
+/// [`a_run`] over two rules and a start with a site for each, so the trace is
+/// two *distinct* steps and the stored rule order is observable.
+async fn a_two_rule_run(
+    lineage: &LineageStore<Gen>,
+) -> (RuleSetAddr, ColoredExpr<Gen>, RewriteOutcome<Gen>) {
+    let addr = lineage
+        .put_rule_set(&two_rules())
+        .await
+        .expect("storing a rule set");
+    let compiled: Vec<RewriteRule<Gen>> = lineage
+        .get_rule_set(&addr)
+        .await
+        .expect("loading it back")
+        .expect("it is present");
+    let start = two_reducible_sites();
+    let outcome = optimize(&start, &compiled, 64, |_| 1).expect("the search runs");
     (addr, start, outcome)
 }
 
@@ -177,7 +243,7 @@ async fn a_run_records_its_trace_and_its_edge() {
     assert_eq!(loaded.rule_set(), &rule_set);
     assert_eq!(loaded.cost_model(), "unit");
     assert!(loaded.best_cost() < loaded.initial_cost());
-    assert!(!loaded.replayable());
+    assert!(loaded.replayable());
 
     // The trace survived the object column, which is the schema question this
     // test exists to answer: a non-FLEXIBLE object drops undeclared keys, so a
@@ -204,6 +270,207 @@ async fn a_run_records_its_trace_and_its_edge() {
 
     // Both endpoints were stored as terms, outside the transaction.
     assert_eq!(row_count(&store, schema::TERM_TABLE).await, 2);
+}
+
+/// The round trip a trace exists for: what was recorded replays, out of the
+/// database, to the morphism the run filed as its best. Both halves of the
+/// reconstruction are exercised — the step rows crossing back into upstream's
+/// own type, and the rules being rebuilt from the stored set in stored order.
+#[tokio::test]
+async fn a_recorded_run_replays_to_its_stored_best() {
+    let (_store, lineage) = bootstrapped("lineage_replay").await;
+    let (rule_set, start, outcome) = a_run(&lineage).await;
+    let run = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("recording the run");
+
+    let loaded = lineage
+        .get_run(&run)
+        .await
+        .expect("loading")
+        .expect("present");
+    assert!(
+        !loaded.steps().is_empty(),
+        "an empty trace replays vacuously"
+    );
+
+    let replayed = lineage
+        .replay_run(&loaded)
+        .await
+        .expect("a recorded run replays");
+    let encoded = catgraph_surreal::term::encode(&replayed).expect("the endpoint encodes");
+    assert_eq!(encoded.addr(), loaded.best());
+    assert_eq!(&replayed, outcome.best());
+}
+
+/// A run whose rule set was never stored cannot be replayed, and says which
+/// address is missing rather than failing somewhere inside the rewrite engine.
+#[tokio::test]
+async fn a_run_whose_rule_set_is_absent_does_not_replay() {
+    let (_store, lineage) = bootstrapped("lineage_replay_absent_rules").await;
+    let (rule_set, start, outcome) = a_run(&lineage).await;
+    let run = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("recording the run");
+    let loaded = lineage
+        .get_run(&run)
+        .await
+        .expect("loading")
+        .expect("present");
+
+    // A second store on a fresh database, holding the run's start term and not
+    // its rule set: the guard before this one passes, so the branch this test
+    // names is the one that fires.
+    let (other_store, empty) = bootstrapped("lineage_replay_empty").await;
+    let terms: TermStore<Gen> = TermStore::open(other_store)
+        .await
+        .expect("opening the term store");
+    terms.put(&start).await.expect("storing the start term");
+
+    let err = empty
+        .replay_run(&loaded)
+        .await
+        .expect_err("the run's rule set is not stored there");
+    let StoreError::Corrupt { detail, .. } = &err else {
+        panic!("expected a corrupt document, got {err:?}");
+    };
+    assert!(detail.contains("rule set"), "{detail}");
+    assert!(detail.contains(rule_set.as_str()), "{detail}");
+}
+
+/// And the guard before it: a replay starts from the run's `start` term, so a
+/// database without it is refused there rather than at the rule set.
+#[tokio::test]
+async fn a_run_whose_start_term_is_absent_does_not_replay() {
+    let (_store, lineage) = bootstrapped("lineage_replay_absent_start").await;
+    let (rule_set, start, outcome) = a_run(&lineage).await;
+    let run = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("recording the run");
+    let loaded = lineage
+        .get_run(&run)
+        .await
+        .expect("loading")
+        .expect("present");
+
+    // The mirror image: the rule set is stored there, the start term is not.
+    let (_other_store, empty) = bootstrapped("lineage_replay_no_start").await;
+    empty
+        .put_rule_set(&rules())
+        .await
+        .expect("storing the same rule set");
+
+    let err = empty
+        .replay_run(&loaded)
+        .await
+        .expect_err("the run's start term is not stored there");
+    let StoreError::Corrupt { detail, .. } = &err else {
+        panic!("expected a corrupt document, got {err:?}");
+    };
+    assert!(detail.contains("`start` term"), "{detail}");
+}
+
+/// A trace's rule indices are relative to the order the rules were stored in,
+/// and this is that claim out of the database: two rules, two distinct steps,
+/// loaded and replayed to the run's own `best`.
+#[tokio::test]
+async fn a_two_rule_run_replays_out_of_the_store_to_its_stored_best() {
+    let (_store, lineage) = bootstrapped("lineage_replay_two_rules").await;
+    let (rule_set, start, outcome) = a_two_rule_run(&lineage).await;
+    let run = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("recording the run");
+
+    let loaded = lineage
+        .get_run(&run)
+        .await
+        .expect("loading")
+        .expect("present");
+    assert_eq!(
+        loaded.steps().len(),
+        2,
+        "the order pin needs two steps, got {:?}",
+        loaded.steps()
+    );
+    assert_ne!(
+        loaded.steps()[0],
+        loaded.steps()[1],
+        "two identical steps reverse to themselves, pinning nothing"
+    );
+
+    let replayed = lineage
+        .replay_run(&loaded)
+        .await
+        .expect("a recorded run replays");
+    let encoded = catgraph_surreal::term::encode(&replayed).expect("the endpoint encodes");
+    assert_eq!(encoded.addr(), loaded.best());
+    assert_eq!(&replayed, outcome.best());
+}
+
+/// A rule set whose pairs were swapped inside the stored encoding no longer
+/// digests to the address it is filed under, so a replay reaching for it is
+/// refused by revalidation rather than replaying the other order.
+#[tokio::test]
+async fn a_run_whose_rule_set_was_reordered_in_place_does_not_replay() {
+    let (store, lineage) = bootstrapped("lineage_replay_swapped_rules").await;
+    let (rule_set, start, outcome) = a_two_rule_run(&lineage).await;
+    let run = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("recording the run");
+    let loaded = lineage
+        .get_run(&run)
+        .await
+        .expect("loading")
+        .expect("present");
+
+    let rid = RecordId::new(schema::RULE_SET_TABLE, rule_set.as_str());
+    let mut response = store
+        .client()
+        .query("SELECT VALUE rules_json FROM $rid")
+        .bind(("rid", rid.clone()))
+        .await
+        .expect("reading the stored encoding");
+    let stored: Option<String> = response.take(0).expect("the column reads back");
+    let stored = stored.expect("the rule set is stored");
+    let mut pairs: Vec<serde_json::Value> =
+        serde_json::from_str(&stored).expect("the encoding is a list of pairs");
+    assert_eq!(pairs.len(), 2, "the swap below needs two rules");
+    pairs.swap(0, 1);
+    let swapped = serde_json::to_string(&pairs).expect("the swapped encoding serializes");
+    assert_ne!(swapped, stored, "the swap has to change the encoding");
+
+    // `OPTION IMPORT;` disables READONLY for the statement, which is how an
+    // edited encoding reaches a write-once row at all.
+    store
+        .client()
+        .query("OPTION IMPORT; UPDATE $rid SET rules_json = $json RETURN NONE")
+        .bind(("rid", rid))
+        .bind(("json", swapped))
+        .await
+        .expect("the edit runs")
+        .check()
+        .expect("and is accepted under OPTION IMPORT");
+
+    let err = lineage
+        .replay_run(&loaded)
+        .await
+        .expect_err("a reordered rule set does not verify");
+    let StoreError::Corrupt { context, detail } = &err else {
+        panic!("expected a corrupt document, got {err:?}");
+    };
+    assert_eq!(
+        context,
+        &format!("{}:{}", schema::RULE_SET_TABLE, rule_set.as_str())
+    );
+    assert!(
+        detail.contains("content address of the stored encoding is"),
+        "{detail}"
+    );
 }
 
 /// The edge write is a content-addressed `RELATE OR UPDATE`, so recording the
@@ -234,6 +501,221 @@ async fn recording_the_same_run_twice_is_idempotent() {
             .len(),
         1
     );
+}
+
+/// `replayable` is `READONLY` and outside the run's content address, so a row
+/// stored with `false` under it is a row re-recording the same run has to
+/// write `true` over. The refused write is retried with `false`: the call
+/// succeeds and the stored flag stands.
+///
+/// **And both halves of the transaction land.** The edge is deleted before the
+/// re-record, so a retry that rolled back — or a refusal absorbed without one —
+/// leaves the run reachable in the table and unreachable in the graph, which is
+/// what `edges_of_run` is read for here.
+#[tokio::test]
+async fn recording_a_run_over_a_row_that_is_not_replayable_is_idempotent() {
+    let (store, lineage) = bootstrapped("lineage_run_replayable_false").await;
+    let (rule_set, start, outcome) = a_run(&lineage).await;
+    let run = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("first write");
+
+    // `OPTION IMPORT;` disables READONLY for the statement, which is how a row
+    // written before the flag existed reaches this database at all.
+    store
+        .client()
+        .query("OPTION IMPORT; UPDATE $rid SET replayable = false RETURN NONE")
+        .bind((
+            "rid",
+            RecordId::new(schema::REWRITE_RUN_TABLE, run.as_str()),
+        ))
+        .await
+        .expect("the edit runs")
+        .check()
+        .expect("and is accepted under OPTION IMPORT");
+
+    store
+        .client()
+        .query(format!("DELETE {}", schema::DERIVES_TABLE))
+        .await
+        .expect("the delete runs")
+        .check()
+        .expect("and the edge is gone");
+    assert_eq!(
+        lineage
+            .edges_of_run(&run)
+            .await
+            .expect("reading the edges")
+            .len(),
+        0,
+        "the deleted edge has to be gone, or the assertion below passes vacuously"
+    );
+
+    let again = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("re-recording the same run over a row flagged false");
+    assert_eq!(again, run);
+
+    assert_eq!(
+        lineage
+            .edges_of_run(&run)
+            .await
+            .expect("reading the edges")
+            .len(),
+        1,
+        "the retry's edge half has to land with its run half"
+    );
+
+    let loaded = lineage
+        .get_run(&run)
+        .await
+        .expect("loading")
+        .expect("present");
+    assert!(!loaded.replayable(), "the stored flag stands");
+    assert_eq!(row_count(&store, schema::REWRITE_RUN_TABLE).await, 1);
+}
+
+/// And that tolerance is `replayable` alone: a row differing in `best`, a
+/// column the run's content address covers, is the collision alarm.
+#[tokio::test]
+async fn recording_a_run_over_a_row_with_a_different_best_is_refused() {
+    let (store, lineage) = bootstrapped("lineage_run_tampered_best").await;
+    let (rule_set, start, outcome) = a_run(&lineage).await;
+    let run = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("first write");
+
+    let planted = format!("b3_{}", "d".repeat(64));
+    store
+        .client()
+        .query("OPTION IMPORT; UPDATE $rid SET best = $best RETURN NONE")
+        .bind((
+            "rid",
+            RecordId::new(schema::REWRITE_RUN_TABLE, run.as_str()),
+        ))
+        .bind(("best", planted))
+        .await
+        .expect("the edit runs")
+        .check()
+        .expect("and is accepted under OPTION IMPORT");
+
+    let err = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect_err("a changed `best` under one address is the alarm");
+    let StoreError::ReadOnly { table, field } = &err else {
+        panic!("expected a read-only refusal, got {err:?}");
+    };
+    assert_eq!(table, schema::REWRITE_RUN_TABLE);
+    assert_eq!(field, "best");
+}
+
+/// A column that sorts *after* `replayable`, differing alone: the row's flag
+/// still reads `true`, so the write is refused on `rule_set` and no retry runs.
+///
+/// This is the row that separates the retry's `field == "replayable"` guard
+/// from an unguarded one. A retry that fired on any read-only refusal would
+/// write `replayable = false` over this row's `true` and be refused on
+/// `replayable`, the earlier column — measured: `field` reads `"replayable"`
+/// with the guard removed, `"rule_set"` with it.
+#[tokio::test]
+async fn recording_a_run_over_a_row_with_a_different_rule_set_is_refused() {
+    let (store, lineage) = bootstrapped("lineage_run_tampered_rule_set_only").await;
+    let (rule_set, start, outcome) = a_run(&lineage).await;
+    let run = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("first write");
+
+    let planted = format!("b3_{}", "e".repeat(64));
+    assert_ne!(
+        planted,
+        rule_set.as_str(),
+        "the plant has to change the column"
+    );
+    store
+        .client()
+        .query("OPTION IMPORT; UPDATE $rid SET rule_set = $planted RETURN NONE")
+        .bind((
+            "rid",
+            RecordId::new(schema::REWRITE_RUN_TABLE, run.as_str()),
+        ))
+        .bind(("planted", planted))
+        .await
+        .expect("the edit runs")
+        .check()
+        .expect("and is accepted under OPTION IMPORT");
+
+    // The flag a retry would overwrite is untouched, which is what makes this
+    // row separate the two. Read raw: the planted `rule_set` is exactly what a
+    // revalidating read refuses.
+    let mut response = store
+        .client()
+        .query("SELECT VALUE replayable FROM $rid")
+        .bind((
+            "rid",
+            RecordId::new(schema::REWRITE_RUN_TABLE, run.as_str()),
+        ))
+        .await
+        .expect("reading the flag");
+    let flag: Option<bool> = response.take(0).expect("the column reads back");
+    assert_eq!(flag, Some(true), "the stored flag has to still be `true`");
+
+    let err = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect_err("a changed `rule_set` under one address is the alarm");
+    let StoreError::ReadOnly { table, field } = &err else {
+        panic!("expected a read-only refusal, got {err:?}");
+    };
+    assert_eq!(table, schema::REWRITE_RUN_TABLE);
+    assert_eq!(field, "rule_set");
+}
+
+/// And the alarm survives a row that *also* carries the stale flag: a row
+/// differing in `rule_set` and in `replayable` is refused on `replayable`
+/// first — the engine names the alphabetically earlier column — and the retry,
+/// writing the `false` that row already holds, surfaces `rule_set`.
+#[tokio::test]
+async fn recording_a_run_over_a_row_with_a_different_rule_set_and_a_stale_flag_is_refused() {
+    let (store, lineage) = bootstrapped("lineage_run_tampered_rule_set").await;
+    let (rule_set, start, outcome) = a_run(&lineage).await;
+    let run = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("first write");
+
+    let planted = format!("b3_{}", "e".repeat(64));
+    assert_ne!(
+        planted,
+        rule_set.as_str(),
+        "the plant has to change the column"
+    );
+    store
+        .client()
+        .query("OPTION IMPORT; UPDATE $rid SET rule_set = $planted, replayable = false RETURN NONE")
+        .bind((
+            "rid",
+            RecordId::new(schema::REWRITE_RUN_TABLE, run.as_str()),
+        ))
+        .bind(("planted", planted))
+        .await
+        .expect("the edit runs")
+        .check()
+        .expect("and is accepted under OPTION IMPORT");
+
+    let err = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect_err("a changed `rule_set` under one address is the alarm");
+    let StoreError::ReadOnly { table, field } = &err else {
+        panic!("expected a read-only refusal, got {err:?}");
+    };
+    assert_eq!(table, schema::REWRITE_RUN_TABLE);
+    assert_eq!(field, "rule_set");
 }
 
 /// Two runs that differ only in the weighting are different records, because
@@ -808,6 +1290,15 @@ async fn row_count(store: &Store, table: &str) -> usize {
         .expect("counting the stored rows");
     let ids: Vec<RecordId> = response.take(0).expect("reading the ids");
     ids.len()
+}
+
+/// Both stores are `Send + Sync` over a generator type that is neither: `G`
+/// reaches them only as `PhantomData<fn() -> G>`.
+#[test]
+fn the_stores_auto_traits_do_not_depend_on_the_generator() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<TermStore<NotSend>>();
+    assert_send_sync::<LineageStore<NotSend>>();
 }
 
 /// The encoding constants are part of the on-disk format, so a change to one is

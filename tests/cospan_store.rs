@@ -6,9 +6,8 @@
 //! produce, straight through the connection. That is the point: the store's
 //! guarantee is not "documents this store wrote are safe", it is "no document
 //! reaches a caller unchecked". Every case here must come back as a typed error
-//! and never as a panic — which for cospans includes the class `Cospan::new`
-//! only rejects under `debug_assert!`, and would otherwise defer to a panic in
-//! a release build.
+//! and never as a panic — an out-of-bounds leg column included, which is the
+//! class the store's own bounds check refuses.
 
 #![cfg(feature = "mem")]
 
@@ -18,27 +17,27 @@ use surrealdb::types::{RecordId, SurrealValue};
 
 /// `id₂`: two wires, each on its own apex vertex.
 fn id2() -> Cospan<usize> {
-    Cospan::new(vec![0, 1], vec![0, 1], vec![7, 7])
+    Cospan::new(vec![0, 1], vec![0, 1], vec![7, 7]).expect("id₂'s legs are in bounds")
 }
 
 /// The same morphism, apex vertices swapped — a different presentation.
 fn id2_swapped() -> Cospan<usize> {
-    Cospan::new(vec![1, 0], vec![1, 0], vec![7, 7])
+    Cospan::new(vec![1, 0], vec![1, 0], vec![7, 7]).expect("id₂'s legs are in bounds")
 }
 
 /// The braid on two wires: a genuinely different morphism.
 fn braid() -> Cospan<usize> {
-    Cospan::new(vec![0, 1], vec![1, 0], vec![7, 7])
+    Cospan::new(vec![0, 1], vec![1, 0], vec![7, 7]).expect("the braid's legs are in bounds")
 }
 
 /// `μ`: two wires in, one out, all on one apex vertex.
 fn merge() -> Cospan<usize> {
-    Cospan::new(vec![0, 0], vec![0], vec![7])
+    Cospan::new(vec![0, 0], vec![0], vec![7]).expect("μ's legs are in bounds")
 }
 
 /// A `0 → 0` cospan whose single apex vertex is hit by neither leg — a scalar.
 fn bubble() -> Cospan<usize> {
-    Cospan::new(vec![], vec![], vec![7])
+    Cospan::new(vec![], vec![], vec![7]).expect("no legs to check")
 }
 
 async fn connect(database: &str) -> Store {
@@ -64,7 +63,7 @@ async fn bootstrapped(database: &str) -> (Store, CospanStore<usize>) {
 /// presentation intact — apex ordering included, which is exactly what a
 /// canonicalising store would have lost.
 #[tokio::test]
-async fn a_stored_cospan_comes_back_structurally_equal() {
+async fn a_stored_cospan_comes_back_equal() {
     let (_store, cospans) = bootstrapped("cospan_round_trip").await;
     let cospan = merge();
 
@@ -75,7 +74,7 @@ async fn a_stored_cospan_comes_back_structurally_equal() {
         .expect("loading a cospan the store just wrote")
         .expect("the cospan is present");
 
-    assert!(loaded.structurally_equal(&cospan));
+    assert_eq!(loaded, cospan);
 }
 
 /// Content addressing makes writing idempotent. Re-storing the same
@@ -95,9 +94,6 @@ async fn re_storing_a_presentation_is_a_no_op() {
 async fn an_absent_cospan_reads_as_none_rather_than_an_error() {
     let (_store, cospans) = bootstrapped("cospan_absent").await;
     let addr = CospanAddr::from_digest(&"a".repeat(64)).expect("64 lowercase hex chars");
-    // `Cospan` deliberately implements no `PartialEq` — its cached identity
-    // flags can lag the maps they summarise — so absence is asserted on the
-    // `Option`, not by comparing it.
     assert!(cospans.get(&addr).await.expect("querying").is_none());
     assert!(!cospans.contains(&addr).await.expect("existence check"));
 }
@@ -123,7 +119,7 @@ async fn a_batch_stores_every_cospan_and_returns_addresses_in_order() {
             .await
             .expect("loading a batched cospan")
             .expect("the cospan is present");
-        assert!(loaded.structurally_equal(cospan));
+        assert_eq!(&loaded, cospan);
     }
 }
 
@@ -156,8 +152,8 @@ async fn a_batch_may_repeat_a_presentation() {
 #[tokio::test]
 async fn scalars_are_distinct_morphisms() {
     let (store, cospans) = bootstrapped("cospan_scalars").await;
-    let none = Cospan::<usize>::new(vec![], vec![], vec![]);
-    let two = Cospan::new(vec![], vec![], vec![7usize, 7]);
+    let none = Cospan::<usize>::new(vec![], vec![], vec![]).expect("no legs to check");
+    let two = Cospan::new(vec![], vec![], vec![7usize, 7]).expect("no legs to check");
 
     cospans
         .put_many(&[none, bubble(), two])
@@ -552,9 +548,8 @@ fn expect_corrupt(result: Result<Option<Cospan<usize>>, StoreError>) {
     }
 }
 
-/// The invariant `Cospan::new` only checks under `debug_assert!`. In a release
-/// build this row would be accepted and the failure deferred to a panic
-/// somewhere else; here it is an error.
+/// A leg column pointing outside the apex, refused by the store's own bounds
+/// check on load.
 #[tokio::test]
 async fn a_row_whose_leg_points_outside_the_apex_is_rejected() {
     let mut row = good_row();
@@ -563,11 +558,14 @@ async fn a_row_whose_leg_points_outside_the_apex_is_rejected() {
     expect_corrupt(load_raw("cospan_corrupt_bounds", refile(row)).await);
 }
 
-/// A decodable-but-non-canonical label spelling is corrupt, not accepted:
-/// `usize::decode` happily parses `"007"`, and a forged row spelled that way —
-/// filed under its own (different) address but carrying the *canonical*
-/// spelling's `canon_key` — would otherwise squat the honest morphism's unique
-/// key while the two-identity discipline reads all green.
+/// A non-canonical label spelling is corrupt, not accepted: a forged row
+/// spelled `"007"` — filed under its own (different) address but carrying the
+/// *canonical* spelling's `canon_key` — would otherwise squat the honest
+/// morphism's unique key while the two-identity discipline reads all green.
+///
+/// `usize::decode` refuses the spelling outright. A `LabelCodec` that accepted
+/// it would be stopped one stage later, by the store's re-encode comparison —
+/// which `src/cospan.rs` pins over a deliberately lenient codec.
 #[tokio::test]
 async fn a_non_canonical_label_spelling_is_rejected_on_load() {
     let mut row = good_row();
@@ -576,9 +574,12 @@ async fn a_non_canonical_label_spelling_is_rejected_on_load() {
     let result = load_raw("cospan_squat_load", refile(row)).await;
     match result {
         Err(StoreError::Corrupt { detail, .. }) => {
-            assert!(detail.contains("non-canonical"), "{detail}");
+            assert!(detail.contains("`007`"), "{detail}");
+            // Which stage refused, not merely that one did: the
+            // canonical-spelling comparison carries `007` too.
+            assert!(detail.contains("not a label of this type"), "{detail}");
         }
-        other => panic!("expected a non-canonical-spelling rejection, got {other:?}"),
+        other => panic!("expected the forged spelling to be refused, got {other:?}"),
     }
 }
 
@@ -722,7 +723,7 @@ async fn an_element_level_write_is_refused_by_the_parent_column() {
         .await
         .expect("reading back")
         .expect("still present");
-    assert!(loaded.structurally_equal(&id2()));
+    assert_eq!(loaded, id2());
 }
 
 // ------------------------------------------------------------------ helpers

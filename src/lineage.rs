@@ -9,14 +9,17 @@
 //! keeps it in that spirit: the step rows are the engine's own indices,
 //! unmodified.
 //!
-//! What the store cannot do yet is replay one. `RewriteStep` has no public
-//! constructor and no serde representation at catgraph v0.11.0, so a trace read
-//! back out of the database cannot be turned into the values `replay` accepts.
-//! The steps persist today and are readable and comparable; re-deriving the
-//! endpoint from them needs an upstream surface that does not exist. The
-//! `replayable` column is where that lands: it is `false` on everything this
-//! build writes, and the day the surface exists new runs record `true` without a
-//! schema migration.
+//! The store replays one as well. [`RunRecord::replay`] turns the stored step
+//! rows back into upstream's own `RewriteStep` values and hands them to
+//! `rewrite::replay`, which re-derives every step's assignment against the
+//! state it has actually reached — so a trace that is not a legal derivation of
+//! the start it is given, under the rules it is given, comes back as an error
+//! rather than as an endpoint. A step binds a rule *index*, so the rules have
+//! to be rebuilt in the order they were stored.
+//!
+//! The `replayable` column says which side of that a row was written on: `true`
+//! for runs this build records, `false` for rows written before the
+//! reconstruction existed.
 //!
 //! # `cost_model` is mandatory, and the reason is arithmetic
 //!
@@ -39,9 +42,9 @@
 //! instead of at the boundary, or not fail at all and match on label equality
 //! where it should not have matched.
 //!
-//! Its rejections arrive as `CatgraphError::Presentation` and are surfaced
-//! unchanged as [`StoreError::Catgraph`], because upstream's message names the
-//! violated condition and nothing here can say it better.
+//! Its rejections arrive as `CatgraphError::Rewrite(RewriteRejection)` and are
+//! surfaced unchanged as [`StoreError::Catgraph`], because upstream's message
+//! names the violated condition and nothing here can say it better.
 //!
 //! # Integers cross the boundary checked
 //!
@@ -55,7 +58,9 @@
 use catgraph_applied::prop::PropSignature;
 use catgraph_applied::prop::colored::ColoredExpr;
 use catgraph_applied::prop::presentation::content::is_arity_well_formed;
-use catgraph_applied::prop::presentation::rewrite::{RewriteOutcome, RewriteRule};
+use catgraph_applied::prop::presentation::rewrite::{
+    self, RewriteOutcome, RewriteRule, RewriteStep,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -296,6 +301,13 @@ impl TraceStep {
     }
 }
 
+/// The field layout `RewriteStep` deserializes from.
+#[derive(Serialize)]
+struct StepWire {
+    rule: usize,
+    matched_edges: Vec<usize>,
+}
+
 /// An optimizer run as it is stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRecord {
@@ -435,24 +447,71 @@ impl RunRecord {
         &self.steps
     }
 
-    /// Whether this trace can be replayed on load.
+    /// Whether the build that recorded this run wrote a stored form
+    /// [`Self::replay`] accepts.
     ///
-    /// Always `false` for anything this build wrote, because replaying a trace
-    /// needs an upstream surface that does not exist at catgraph v0.11.0: the
-    /// step type has no public constructor and no serde representation, so a
-    /// stored step cannot become the value `replay` accepts.
+    /// `true` for every run this build records; `false` for a row written
+    /// before the reconstruction existed.
     ///
     /// It is deliberately **not** part of the run's content address. The flag
-    /// describes what a *reader* can do with the trace, not what the run was, so
-    /// folding it in would give the same run two addresses either side of the
-    /// upstream change. It is also deliberately not re-derived on load: a build
-    /// that can replay must be able to read a run an older build wrote, and a
-    /// build that cannot must not silently rewrite the claim. The column is
-    /// `READONLY`, so an older build re-writing a newer build's run is refused
-    /// loudly rather than downgrading it.
+    /// describes the writer, not what the run was, so folding it in would give
+    /// the same run two addresses either side of the change. It is also
+    /// deliberately not re-derived on load: a build that can replay must be able
+    /// to read a run an older build wrote, and a build that cannot must not
+    /// silently rewrite the claim. The column is `READONLY`, so an older build
+    /// re-writing a newer build's run is refused loudly rather than downgrading
+    /// it.
     #[must_use]
     pub fn replayable(&self) -> bool {
         self.replayable
+    }
+
+    /// Re-derive the morphism this run's trace describes.
+    ///
+    /// `start` is the morphism the run began from and `rules` the rule set it
+    /// ran under, rebuilt through `RewriteRule::new` **in stored order**: a step
+    /// binds a rule *index*, so a differently ordered slice replays the same
+    /// steps to a different endpoint or to none at all.
+    ///
+    /// Every step is re-derived against the state the replay has reached, so
+    /// the stored rows are checked rather than trusted.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Corrupt`] for a step column that is not an index,
+    /// [`StoreError::Codec`] if a step does not cross into upstream's own step
+    /// type, and [`StoreError::Catgraph`] if `start`, `rules` and the steps are
+    /// not a derivation — naming the step that failed.
+    pub fn replay<G: PropSignature>(
+        &self,
+        start: &ColoredExpr<G>,
+        rules: &[RewriteRule<G>],
+    ) -> Result<ColoredExpr<G>> {
+        Ok(rewrite::replay(start, rules, &self.rewrite_steps()?)?)
+    }
+
+    /// The stored steps as upstream's own [`RewriteStep`] values.
+    ///
+    /// The crossing goes through `RewriteStep`'s serde derive, its fields being
+    /// private and its only other constructor taking a live match site. The
+    /// wire shape is therefore a coupling between the two crates, and
+    /// `tests/golden.rs` pins it.
+    fn rewrite_steps(&self) -> Result<Vec<RewriteStep>> {
+        self.steps
+            .iter()
+            .enumerate()
+            .map(|(position, step)| {
+                let wire = StepWire {
+                    rule: to_index(position, "rule", step.rule)?,
+                    matched_edges: step
+                        .matched_edges
+                        .iter()
+                        .map(|edge| to_index(position, "matched_edges", *edge))
+                        .collect::<Result<Vec<usize>>>()?,
+                };
+                Ok(serde_json::from_value(serde_json::to_value(wire)?)?)
+            })
+            .collect()
     }
 
     /// Re-derive everything derivable from the stored columns.
@@ -580,8 +639,8 @@ where
         states_explored: to_column("states_explored", outcome.states_explored())?,
         step_count: to_column("step_count", steps.len())?,
         steps,
-        // No build can replay a stored trace yet; see `RunRecord::replayable`.
-        replayable: false,
+        // This build reconstructs the stored steps; see `RunRecord::replayable`.
+        replayable: true,
     };
     record.addr = run_address(&record)?;
     Ok((record, endpoints))
@@ -853,6 +912,17 @@ fn screen<G: PropSignature>(expr: &ColoredExpr<G>) -> Result<()> {
     Ok(())
 }
 
+/// Widen a stored step column back into an index.
+///
+/// The column is a signed integer read off disk, so a negative entry is
+/// possible and is a corrupt document rather than a rewrite failure.
+fn to_index(step: usize, field: &str, value: i64) -> Result<usize> {
+    usize::try_from(value).map_err(|_| StoreError::Corrupt {
+        context: format!("{REWRITE_RUN_TABLE}.steps"),
+        detail: format!("step {step} holds `{field}` = {value}, which is not an index"),
+    })
+}
+
 /// Narrow a count or index into the database's integer lane.
 ///
 /// The SDK's own `usize` conversion is an unchecked `as i64`, and catgraph
@@ -882,6 +952,7 @@ fn cost_column(field: &str, value: u64) -> Result<i64> {
 mod tests {
     use std::borrow::Cow;
 
+    use catgraph::errors::{CatgraphError, RewriteRejection};
     use catgraph_applied::prop::Free;
     use catgraph_applied::prop::presentation::rewrite::optimize;
     use serde::Deserialize;
@@ -1035,7 +1106,7 @@ mod tests {
         assert_eq!(record.cost_model(), "unit");
         assert_eq!(record.rule_set(), rule_set.addr());
         assert_eq!(record.step_count() as usize, record.steps().len());
-        assert!(!record.replayable(), "no build can replay a stored trace");
+        assert!(record.replayable(), "this build reconstructs stored steps");
         record.revalidate().expect("its own columns revalidate");
     }
 
@@ -1148,11 +1219,296 @@ mod tests {
             record.states_explored(),
             record.step_count(),
             record.steps().to_vec(),
-            true,
+            !record.replayable(),
         );
         flipped
             .revalidate()
             .expect("a flipped flag leaves the address alone");
+    }
+
+    /// `μ ; Δ ; μ ; Δ : 2 → 2` — overlapping reducible sites for both rules.
+    fn two_reducible_sites() -> ColoredExpr<Gen> {
+        let add_copy = || {
+            Free::compose(Free::generator(Gen::Add), Free::<Gen>::generator(Gen::Copy))
+                .expect("μ ; Δ composes")
+        };
+        let twice = Free::compose(add_copy(), add_copy()).expect("μ ; Δ ; μ ; Δ composes");
+        ColoredExpr::new(vec![(), ()], twice).expect("μ ; Δ ; μ ; Δ type-checks")
+    }
+
+    /// Steps are applied **in order**: each one's hyperedges index the state the
+    /// previous ones left behind, so the recorded sequence read backwards is a
+    /// different claim about a different state.
+    ///
+    /// `μ ; Δ ; μ ; Δ` under both rules records two *distinct* steps — rule 0 at
+    /// edges `[1, 2]`, then rule 1 at `[0, 1]` — which is what makes reversing
+    /// them observable at all; `an_outcome` and `a_two_rule_outcome` each record
+    /// the one step `[(0, [0, 1])]`, which reverses to itself.
+    #[test]
+    fn a_multi_step_trace_replays_only_in_the_recorded_order() {
+        let rule_set = encode_rule_set(&[
+            (copy_then_add(), identity()),
+            (add_then_copy(), identity_two()),
+        ])
+        .expect("both pairs are rules");
+        let compiled: Vec<RewriteRule<Gen>> = rule_set.revalidate().expect("revalidates");
+        let start = two_reducible_sites();
+        let outcome = optimize(&start, &compiled, 64, |_| 1).expect("the search runs");
+        let record = encode_run(rule_set.addr(), &start, &outcome, "unit").expect("encodes");
+
+        assert_eq!(
+            record.steps().len(),
+            2,
+            "the order pin needs two steps, got {:?}",
+            record.steps()
+        );
+        assert_ne!(
+            record.steps()[0],
+            record.steps()[1],
+            "two identical steps reverse to themselves, pinning nothing"
+        );
+
+        let replayed = record
+            .replay(&start, &compiled)
+            .expect("the recorded order replays");
+        assert_eq!(&replayed, outcome.best());
+
+        let mut reversed = record.steps().to_vec();
+        reversed.reverse();
+        let out_of_order = RunRecord::from_columns(
+            record.addr().clone(),
+            record.codec().to_owned(),
+            record.rule_set().clone(),
+            record.start().clone(),
+            record.best().clone(),
+            record.cost_model().to_owned(),
+            record.initial_cost(),
+            record.best_cost(),
+            record.fuel_exhausted(),
+            record.states_explored(),
+            record.step_count(),
+            reversed,
+            record.replayable(),
+        );
+        match out_of_order.replay(&start, &compiled) {
+            Err(StoreError::Catgraph(CatgraphError::Rewrite(RewriteRejection::NotAMatch {
+                step,
+            }))) => assert_eq!(step, Some(1)),
+            other => panic!("expected a non-match at reversed step 1, got {other:?}"),
+        }
+    }
+
+    /// `μ ; Δ : 2 → 2`, whose left-hand side cannot fire on `Δ ; μ`.
+    fn add_then_copy() -> ColoredExpr<Gen> {
+        let expr = Free::compose(Free::generator(Gen::Add), Free::<Gen>::generator(Gen::Copy))
+            .expect("μ ; Δ composes");
+        ColoredExpr::new(vec![(), ()], expr).expect("μ ; Δ type-checks")
+    }
+
+    /// `id₂ : 2 → 2`.
+    fn identity_two() -> ColoredExpr<Gen> {
+        ColoredExpr::new(vec![(), ()], Free::<Gen>::identity(2)).expect("id₂ type-checks")
+    }
+
+    /// A run over **two** rules, so that reordering them is observable at all.
+    fn a_two_rule_outcome() -> (RuleSetRecord, ColoredExpr<Gen>, RewriteOutcome<Gen>) {
+        let record = encode_rule_set(&[
+            (copy_then_add(), identity()),
+            (add_then_copy(), identity_two()),
+        ])
+        .expect("both pairs are rules");
+        let compiled: Vec<RewriteRule<Gen>> = record.revalidate().expect("revalidates");
+        let start = copy_then_add();
+        let outcome = optimize(&start, &compiled, 16, |_| 1).expect("the search runs");
+        (record, start, outcome)
+    }
+
+    /// A recorded trace is a witness: replayed against the start and the rules
+    /// it was recorded under, it re-derives the run's own `best`.
+    #[test]
+    fn a_recorded_run_replays_to_its_best() {
+        let (rule_set, start, outcome) = an_outcome();
+        let compiled: Vec<RewriteRule<Gen>> = rule_set.revalidate().expect("revalidates");
+        let record = encode_run(rule_set.addr(), &start, &outcome, "unit").expect("encodes");
+        assert!(
+            !record.steps().is_empty(),
+            "an empty trace replays vacuously"
+        );
+
+        let replayed = record
+            .replay(&start, &compiled)
+            .expect("a recorded trace replays");
+        assert_eq!(&replayed, outcome.best());
+        let encoded = term::encode(&replayed).expect("the endpoint encodes");
+        assert_eq!(encoded.addr(), record.best());
+    }
+
+    /// The stored hyperedges are re-derived against the state, not trusted: a
+    /// row whose `matched_edges` were reordered is not a match there.
+    #[test]
+    fn a_tampered_matched_edges_row_does_not_replay() {
+        let (rule_set, start, outcome) = an_outcome();
+        let compiled: Vec<RewriteRule<Gen>> = rule_set.revalidate().expect("revalidates");
+        let record = encode_run(rule_set.addr(), &start, &outcome, "unit").expect("encodes");
+
+        let mut steps = record.steps().to_vec();
+        let first = steps.first().expect("the fixture run takes a step").clone();
+        assert_eq!(
+            first.matched_edges().len(),
+            2,
+            "the tamper below needs two edges to swap"
+        );
+        let mut reordered = first.matched_edges().to_vec();
+        reordered.reverse();
+        steps[0] = TraceStep::from_columns(first.rule(), reordered);
+
+        let tampered = RunRecord::from_columns(
+            record.addr().clone(),
+            record.codec().to_owned(),
+            record.rule_set().clone(),
+            record.start().clone(),
+            record.best().clone(),
+            record.cost_model().to_owned(),
+            record.initial_cost(),
+            record.best_cost(),
+            record.fuel_exhausted(),
+            record.states_explored(),
+            record.step_count(),
+            steps,
+            record.replayable(),
+        );
+        match tampered.replay(&start, &compiled) {
+            Err(StoreError::Catgraph(CatgraphError::Rewrite(RewriteRejection::NotAMatch {
+                step,
+            }))) => assert_eq!(step, Some(0)),
+            other => panic!("expected a step-0 non-match, got {other:?}"),
+        }
+    }
+
+    /// A step binds a rule *index*, so the same trace read against a reversed
+    /// rule slice names a different rule — here one whose left-hand side is not
+    /// at those hyperedges.
+    #[test]
+    fn rules_rebuilt_in_reverse_order_do_not_replay_the_trace() {
+        let (rule_set, start, outcome) = a_two_rule_outcome();
+        let mut compiled: Vec<RewriteRule<Gen>> = rule_set.revalidate().expect("revalidates");
+        let record = encode_run(rule_set.addr(), &start, &outcome, "unit").expect("encodes");
+        record
+            .replay(&start, &compiled)
+            .expect("stored order replays");
+
+        compiled.reverse();
+        match record.replay(&start, &compiled) {
+            Err(StoreError::Catgraph(CatgraphError::Rewrite(RewriteRejection::NotAMatch {
+                step,
+            }))) => assert_eq!(step, Some(0)),
+            other => panic!("expected a step-0 non-match under reversed rules, got {other:?}"),
+        }
+    }
+
+    /// `Δ ; μ ; Δ ; μ : 1 → 1`.
+    fn copy_add_twice() -> ColoredExpr<Gen> {
+        let once = || {
+            Free::compose(Free::generator(Gen::Copy), Free::<Gen>::generator(Gen::Add))
+                .expect("Δ ; μ composes")
+        };
+        let twice = Free::compose(once(), once()).expect("Δ ; μ ; Δ ; μ composes");
+        ColoredExpr::new(vec![()], twice).expect("Δ ; μ ; Δ ; μ type-checks")
+    }
+
+    /// The other branch a reversed rule slice reaches: two rules sharing a
+    /// left-hand side both match at the recorded site, so the trace replays —
+    /// to the endpoint the *other* rule rewrites to.
+    #[test]
+    fn rules_sharing_a_left_hand_side_replay_swapped_to_a_different_endpoint() {
+        let rule_set = encode_rule_set(&[
+            (copy_then_add(), identity()),
+            (copy_then_add(), copy_add_twice()),
+        ])
+        .expect("both pairs are rules");
+        let compiled: Vec<RewriteRule<Gen>> = rule_set.revalidate().expect("revalidates");
+        let start = copy_then_add();
+        let outcome = optimize(&start, &compiled, 16, |_| 1).expect("the search runs");
+        let record = encode_run(rule_set.addr(), &start, &outcome, "unit").expect("encodes");
+        assert_eq!(
+            record.steps().len(),
+            1,
+            "the pin needs the one-step trace, got {:?}",
+            record.steps()
+        );
+        assert_eq!(
+            record.steps()[0].rule(),
+            0,
+            "the pin needs the trace to name rule 0, got {:?}",
+            record.steps()
+        );
+        record
+            .replay(&start, &compiled)
+            .expect("stored order replays");
+
+        let swapped_set = encode_rule_set(&[
+            (copy_then_add(), copy_add_twice()),
+            (copy_then_add(), identity()),
+        ])
+        .expect("the swapped pairs are rules");
+        let swapped: Vec<RewriteRule<Gen>> = swapped_set.revalidate().expect("revalidates");
+        let replayed = record
+            .replay(&start, &swapped)
+            .expect("the shared left-hand side matches at the recorded site");
+        let endpoint = term::encode(&replayed).expect("the endpoint encodes");
+        assert_ne!(
+            endpoint.addr(),
+            record.best(),
+            "swapped rules replayed to `{}`, against a stored best of `{}`",
+            endpoint.addr(),
+            record.best()
+        );
+    }
+
+    /// The mirror a stored trace crosses back through renders the same bytes as
+    /// upstream's own step, so a field renamed on either side is a failure here.
+    #[test]
+    fn the_step_wire_mirror_renders_upstreams_step_bytes() {
+        let (_rule_set, _start, outcome) = an_outcome();
+        let steps = outcome.steps();
+        assert_eq!(steps.len(), 1, "the fixture run takes one step: {steps:?}");
+        let wire = StepWire {
+            rule: steps[0].rule(),
+            matched_edges: steps[0].matched_edges().to_vec(),
+        };
+        assert_eq!(
+            serde_json::to_string(&wire).expect("the mirror serializes"),
+            serde_json::to_string(&steps[0]).expect("upstream's step serializes")
+        );
+    }
+
+    /// A step column off disk is a signed integer, so it can be negative — and
+    /// that is a corrupt document rather than a rewrite failure.
+    #[test]
+    fn a_negative_step_column_does_not_replay() {
+        let (rule_set, start, outcome) = an_outcome();
+        let compiled: Vec<RewriteRule<Gen>> = rule_set.revalidate().expect("revalidates");
+        let record = encode_run(rule_set.addr(), &start, &outcome, "unit").expect("encodes");
+
+        let negative = RunRecord::from_columns(
+            record.addr().clone(),
+            record.codec().to_owned(),
+            record.rule_set().clone(),
+            record.start().clone(),
+            record.best().clone(),
+            record.cost_model().to_owned(),
+            record.initial_cost(),
+            record.best_cost(),
+            record.fuel_exhausted(),
+            record.states_explored(),
+            record.step_count(),
+            vec![TraceStep::from_columns(-1, vec![0])],
+            record.replayable(),
+        );
+        let err = negative
+            .replay(&start, &compiled)
+            .expect_err("a negative rule index is not an index");
+        assert!(matches!(err, StoreError::Corrupt { .. }), "{err}");
     }
 
     #[test]

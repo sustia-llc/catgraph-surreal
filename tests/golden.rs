@@ -89,7 +89,8 @@ fn term_identity_is_pinned_to_exact_bytes() {
 fn cospan_identity_is_pinned_to_exact_bytes() {
     // μ-shape with a scalar: two domain wires onto one apex vertex, one
     // codomain wire, one untouched vertex.
-    let fixture = Cospan::new(vec![0, 0], vec![0], vec![3usize, 9]);
+    let fixture =
+        Cospan::new(vec![0, 0], vec![0], vec![3usize, 9]).expect("μ's legs are in bounds");
     let record = cospan::encode(&fixture).expect("the fixture encodes");
     assert_eq!(record.codec(), "cgc1");
     assert_eq!(
@@ -154,6 +155,29 @@ fn run_and_derivation_identity_are_pinned_to_exact_bytes() {
         edge.addr().as_str(),
         "b3_7a57ab5622cd95676da7b20968ff27839ed569edec05e448dbd5ac582a9a8f93"
     );
+}
+
+/// `RewriteStep`'s serde shape is the seam a stored trace crosses back through:
+/// its fields are private, so `lineage::RunRecord::replay` rebuilds each step by
+/// deserializing this exact field layout. An upstream rename, reorder, or added
+/// field therefore breaks replay, and this is where it is noticed.
+#[test]
+fn the_rewrite_step_wire_shape_is_pinned_to_exact_bytes() {
+    let rule_set = lineage::encode_rule_set(&fixture_rules()).expect("the fixture encodes");
+    let compiled: Vec<RewriteRule<Gen>> = rule_set.revalidate().expect("it revalidates");
+    let outcome = optimize(&fixture_term(), &compiled, 16, |_| 1).expect("the search runs");
+
+    let steps = outcome.steps();
+    assert_eq!(steps.len(), 1, "the fixture run takes exactly one step");
+    assert_eq!(
+        serde_json::to_string(&steps[0]).expect("a step serializes"),
+        r#"{"rule":0,"matched_edges":[0,1]}"#
+    );
+
+    // And the direction replay depends on: that layout parses back into a step.
+    let rebuilt: catgraph_applied::prop::presentation::rewrite::RewriteStep =
+        serde_json::from_str(r#"{"rule":0,"matched_edges":[0,1]}"#).expect("the layout parses");
+    assert_eq!(&rebuilt, &steps[0]);
 }
 
 #[test]

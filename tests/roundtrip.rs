@@ -153,7 +153,7 @@ fn fixture() -> Fixture {
     Fixture {
         // A μ-shape with a scalar: two domain wires onto one apex vertex, one
         // codomain wire, one untouched vertex.
-        cospan: Cospan::new(vec![0, 0], vec![0], vec![3usize, 9]),
+        cospan: Cospan::new(vec![0, 0], vec![0], vec![3usize, 9]).expect("μ's legs are in bounds"),
         weights: awkward_weights(),
         snapshot: Snapshot {
             beliefs: vec![0.25, 0.5, 0.25],

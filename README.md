@@ -147,11 +147,12 @@ proptest asserts the equivalence in **both** directions against
 would refuse a genuinely new one; equal morphisms must mean equal keys, or the
 store would hold duplicates it promised not to.
 
-One more guard exists because catgraph cannot provide it: `Cospan::new`
-bounds-checks legs against the apex under `debug_assert!` only, so a release
-build accepts an out-of-bounds leg and defers the failure to a panic somewhere
-else. This store bounds-checks on both sides — on write, so such a value never
-reaches disk, and on load, where it arrives as a tampered column.
+One more guard sits on both sides of the store. `Cospan::new` bounds-checks
+legs against the apex in every build profile, but `Cospan::new_unchecked` and
+`Cospan::add_boundary_node_unchecked` check only under `debug_assert!`, so a
+release build accepts an out-of-bounds leg through either. This store
+bounds-checks on write, so such a value never reaches disk, and on load, where
+it arrives as a tampered column.
 
 ## Weights
 
@@ -196,12 +197,13 @@ be persisted: two runs measured under different weightings produce numbers that
 look comparable and are not. A run that did not say which weighting produced its
 numbers has recorded numbers nobody can read.
 
-What the store cannot do yet is *replay* a trace. The step type has no public
-constructor and no serde representation at catgraph v0.11.0, so a stored step
-cannot become the value `replay` accepts. The steps persist today and are
-readable and comparable; re-deriving the endpoint from them needs an upstream
-surface that does not exist. The `replayable` column is where that lands — `false`
-on everything this build writes, and flippable without a schema migration.
+A stored trace *replays*. `replay_run` loads the run's start term, rebuilds its
+rules in stored order, and hands the steps to catgraph's `replay`, which
+re-derives each one against the state it has reached — so a trace that is not a
+legal derivation of that start under those rules comes back as an error rather
+than as an endpoint. Rule *order* is load-bearing: a step binds an index, not a
+rule identity. The `replayable` column says which side of the change a row was
+written on — `true` for runs this build records, `false` for older rows.
 
 The `derives` edge is a `TYPE RELATION` table whose record id is the digest of
 the tuple it represents: parent, child, and the run that derived one from the

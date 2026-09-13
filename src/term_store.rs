@@ -21,13 +21,17 @@
 //!
 //! # A store value implies a verified schema
 //!
-//! There is no constructor that skips the schema: [`TermStore::open`]
-//! bootstraps and verifies before handing back a value. That is not ceremony —
+//! [`TermStore::open`] bootstraps and verifies before handing back a value,
+//! and the crate-private `TermStore::from_bootstrapped` leaves that to its
+//! caller, which bootstraps and verifies the term schema before the value is
+//! used or returned. That is
+//! not ceremony —
 //! a write against an undefined table would make SurrealDB auto-create it
 //! `SCHEMALESS`, and a *later* bootstrap's `DEFINE TABLE IF NOT EXISTS` would
 //! then bless the impostor rather than replace it, permanently disarming every
 //! database-side guard while every documented signal stays green. Making the
-//! unbootstrapped store unrepresentable closes that hole at the type level;
+//! unbootstrapped store unrepresentable to callers closes that hole at the
+//! type level;
 //! the definition-level drift guard closes it against tables created by
 //! someone else.
 
@@ -185,12 +189,20 @@ impl<G> TermStore<G> {
     ///
     /// Fails if the schema cannot be defined or does not verify.
     pub async fn open(store: Store) -> Result<Self> {
-        let repository = Self {
-            store,
-            generator: PhantomData,
-        };
+        let repository = Self::from_bootstrapped(store);
         repository.bootstrap().await?;
         Ok(repository)
+    }
+
+    /// Wrap a connection, leaving the term schema's bootstrap to the caller.
+    ///
+    /// Unchecked: the caller bootstraps and verifies that schema before the
+    /// value is used or returned, which is what [`Self::open`] does with it.
+    pub(crate) fn from_bootstrapped(store: Store) -> Self {
+        Self {
+            store,
+            generator: PhantomData,
+        }
     }
 
     /// The connection this store reads and writes through.

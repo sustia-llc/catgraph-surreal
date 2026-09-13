@@ -36,8 +36,9 @@ use proptest::prelude::*;
 fn any_cospan() -> impl Strategy<Value = Cospan<usize>> {
     prop::collection::vec(0usize..2, 0..4usize).prop_flat_map(|middle| {
         let apex = middle.len();
-        (Just(middle), leg(apex), leg(apex))
-            .prop_map(|(middle, left, right)| Cospan::new(left, right, middle))
+        (Just(middle), leg(apex), leg(apex)).prop_map(|(middle, left, right)| {
+            Cospan::new(left, right, middle).expect("`leg` generates in-bounds entries")
+        })
     })
 }
 
@@ -90,6 +91,7 @@ fn permute_apex(cospan: &Cospan<usize>, permutation: &[usize]) -> Cospan<usize> 
         relabel(cospan.right_to_middle()),
         middle,
     )
+    .expect("a permutation of the apex keeps every leg entry in bounds")
 }
 
 proptest! {
@@ -133,10 +135,11 @@ proptest! {
 /// passes vacuously by only ever testing the identity.
 #[test]
 fn permuting_an_apex_moves_the_presentation() {
-    let cospan = Cospan::new(vec![0, 1], vec![0, 1], vec![7usize, 7]);
+    let cospan =
+        Cospan::new(vec![0, 1], vec![0, 1], vec![7usize, 7]).expect("id₂'s legs are in bounds");
     let swapped = permute_apex(&cospan, &[1, 0]);
     assert_eq!(swapped.left_to_middle(), [1, 0]);
     assert_eq!(swapped.right_to_middle(), [1, 0]);
-    assert!(!cospan.structurally_equal(&swapped));
+    assert_ne!(cospan, swapped);
     assert_eq!(cospan.canonical_form(), swapped.canonical_form());
 }

@@ -589,12 +589,11 @@ where
 /// # What does not survive the rebuild
 ///
 /// A presentation also carries a rewrite-depth bound and an engine selector.
-/// `engine` has a public accessor, so a caller that knows the original can
-/// restore it with `set_engine`; **`rewrite_depth` has no accessor at catgraph
-/// v0.11.0**, so it cannot be read off a source presentation and is restored to
-/// the constructor default here. A caller that needs a non-default bound must
-/// carry it itself and build through `Presentation::with_depth`. That is a seam
-/// in the upstream surface, not a decision taken here.
+/// Neither is stored, so both come back at the constructor default. Both have
+/// public accessors (`rewrite_depth`, `engine`), so a caller holding the
+/// original can carry them: `set_engine` restores the selector, and a
+/// non-default bound needs `Presentation::with_depth` in place of this
+/// function.
 ///
 /// # Errors
 ///

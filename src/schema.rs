@@ -603,9 +603,9 @@ pub const REWRITE_RUN_TABLE_DEFINITION: &str =
 /// different weightings are not comparable. A run that did not say which
 /// weighting produced its numbers has recorded numbers nobody can use.
 ///
-/// `replayable` carries `DEFAULT false` so that the day a persisted trace can be
-/// replayed on load, new runs can start recording `true` without a schema
-/// migration.
+/// `replayable` carries `DEFAULT false`, which is what a row written before the
+/// trace reconstruction existed reads as; runs recorded by this build write
+/// `true` into the same column, with no schema change between the two.
 pub const REWRITE_RUN_FIELD_DEFINITIONS: [(&str, &str); 13] = [
     (
         "id",

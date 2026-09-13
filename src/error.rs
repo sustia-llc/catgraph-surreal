@@ -171,13 +171,10 @@ pub enum StoreError {
         detail: String,
     },
 
-    /// A stored document violates an invariant its constructor only checks
-    /// under `debug_assert!`.
-    ///
-    /// Cospan and span constructors validate leg bounds with `debug_assert!`
-    /// only, so a release build handed a corrupt document defers the failure to
-    /// a panic somewhere later. The store bounds-checks on load and reports
-    /// this instead.
+    /// A value violates an invariant no constructor checked: on load, a
+    /// column read off disk (leg bounds, derived sizes, content addresses hold
+    /// only by re-derivation); on write, a cospan leg pointing outside its
+    /// apex. Reported rather than handed to an interpreter that panics later.
     #[error("corrupt document in {context}: {detail}")]
     Corrupt {
         /// The structure or record the corruption was found in.
