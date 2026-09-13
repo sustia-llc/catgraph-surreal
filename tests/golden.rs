@@ -157,6 +157,29 @@ fn run_and_derivation_identity_are_pinned_to_exact_bytes() {
     );
 }
 
+/// `RewriteStep`'s serde shape is the seam a stored trace crosses back through:
+/// its fields are private, so `lineage::RunRecord::replay` rebuilds each step by
+/// deserializing this exact field layout. An upstream rename, reorder, or added
+/// field therefore breaks replay, and this is where it is noticed.
+#[test]
+fn the_rewrite_step_wire_shape_is_pinned_to_exact_bytes() {
+    let rule_set = lineage::encode_rule_set(&fixture_rules()).expect("the fixture encodes");
+    let compiled: Vec<RewriteRule<Gen>> = rule_set.revalidate().expect("it revalidates");
+    let outcome = optimize(&fixture_term(), &compiled, 16, |_| 1).expect("the search runs");
+
+    let steps = outcome.steps();
+    assert_eq!(steps.len(), 1, "the fixture run takes exactly one step");
+    assert_eq!(
+        serde_json::to_string(&steps[0]).expect("a step serializes"),
+        r#"{"rule":0,"matched_edges":[0,1]}"#
+    );
+
+    // And the direction replay depends on: that layout parses back into a step.
+    let rebuilt: catgraph_applied::prop::presentation::rewrite::RewriteStep =
+        serde_json::from_str(r#"{"rule":0,"matched_edges":[0,1]}"#).expect("the layout parses");
+    assert_eq!(&rebuilt, &steps[0]);
+}
+
 #[test]
 fn document_digest_is_pinned_to_exact_bytes() {
     let record = doc::encode(

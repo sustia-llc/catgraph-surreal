@@ -197,10 +197,13 @@ be persisted: two runs measured under different weightings produce numbers that
 look comparable and are not. A run that did not say which weighting produced its
 numbers has recorded numbers nobody can read.
 
-What the store does not do yet is *replay* a trace. The steps persist today and
-are readable and comparable; turning them back into the values `replay` accepts
-is not wired here. The `replayable` column is where that lands — `false` on
-everything this build writes, and flippable without a schema migration.
+A stored trace *replays*. `replay_run` loads the run's start term, rebuilds its
+rules in stored order, and hands the steps to catgraph's `replay`, which
+re-derives each one against the state it has reached — so a trace that is not a
+legal derivation of that start under those rules comes back as an error rather
+than as an endpoint. Rule *order* is load-bearing: a step binds an index, not a
+rule identity. The `replayable` column says which side of the change a row was
+written on — `true` for runs this build records, `false` for older rows.
 
 The `derives` edge is a `TYPE RELATION` table whose record id is the digest of
 the tuple it represents: parent, child, and the run that derived one from the

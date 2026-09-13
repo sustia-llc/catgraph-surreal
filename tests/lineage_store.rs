@@ -177,7 +177,7 @@ async fn a_run_records_its_trace_and_its_edge() {
     assert_eq!(loaded.rule_set(), &rule_set);
     assert_eq!(loaded.cost_model(), "unit");
     assert!(loaded.best_cost() < loaded.initial_cost());
-    assert!(!loaded.replayable());
+    assert!(loaded.replayable());
 
     // The trace survived the object column, which is the schema question this
     // test exists to answer: a non-FLEXIBLE object drops undeclared keys, so a
@@ -204,6 +204,64 @@ async fn a_run_records_its_trace_and_its_edge() {
 
     // Both endpoints were stored as terms, outside the transaction.
     assert_eq!(row_count(&store, schema::TERM_TABLE).await, 2);
+}
+
+/// The round trip a trace exists for: what was recorded replays, out of the
+/// database, to the morphism the run filed as its best. Both halves of the
+/// reconstruction are exercised — the step rows crossing back into upstream's
+/// own type, and the rules being rebuilt from the stored set in stored order.
+#[tokio::test]
+async fn a_recorded_run_replays_to_its_stored_best() {
+    let (_store, lineage) = bootstrapped("lineage_replay").await;
+    let (rule_set, start, outcome) = a_run(&lineage).await;
+    let run = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("recording the run");
+
+    let loaded = lineage
+        .get_run(&run)
+        .await
+        .expect("loading")
+        .expect("present");
+    assert!(
+        !loaded.steps().is_empty(),
+        "an empty trace replays vacuously"
+    );
+
+    let replayed = lineage
+        .replay_run(&loaded)
+        .await
+        .expect("a recorded run replays");
+    let encoded = catgraph_surreal::term::encode(&replayed).expect("the endpoint encodes");
+    assert_eq!(encoded.addr(), loaded.best());
+    assert_eq!(&replayed, outcome.best());
+}
+
+/// A run whose rule set was never stored cannot be replayed, and says which
+/// address is missing rather than failing somewhere inside the rewrite engine.
+#[tokio::test]
+async fn a_run_whose_rule_set_is_absent_does_not_replay() {
+    let (_store, lineage) = bootstrapped("lineage_replay_absent_rules").await;
+    let (rule_set, start, outcome) = a_run(&lineage).await;
+    let run = lineage
+        .record_run(&rule_set, &start, &outcome, "unit")
+        .await
+        .expect("recording the run");
+    let loaded = lineage
+        .get_run(&run)
+        .await
+        .expect("loading")
+        .expect("present");
+
+    // A second store on a fresh database holds the same schemas and none of the
+    // rows, so the run's pointers dangle.
+    let (_other_store, empty) = bootstrapped("lineage_replay_empty").await;
+    let err = empty
+        .replay_run(&loaded)
+        .await
+        .expect_err("nothing the run points at is stored there");
+    assert!(matches!(err, StoreError::Corrupt { .. }), "{err}");
 }
 
 /// The edge write is a content-addressed `RELATE OR UPDATE`, so recording the

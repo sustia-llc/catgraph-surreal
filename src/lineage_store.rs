@@ -42,7 +42,6 @@
 //! What still refuses a *changed* edge is the `READONLY` columns: a different
 //! payload under the same tuple is a changed value, and the engine says so.
 
-use std::marker::PhantomData;
 use std::sync::LazyLock;
 
 use catgraph_applied::prop::PropSignature;
@@ -63,7 +62,7 @@ use crate::schema::{
 };
 use crate::store::Store;
 use crate::term::TermRecord;
-use crate::term_store::TermRow;
+use crate::term_store::{TermRow, TermStore};
 
 /// Write one rule set, creating it or leaving an identical row untouched.
 const PUT_RULE_SET: &str = "UPSERT $row.id CONTENT $row RETURN NONE";
@@ -343,12 +342,15 @@ from_key!(TermAddr, RuleSetAddr, RunAddr, DerivationAddr);
 
 /// Stores and loads rule sets, optimizer traces, and the derivation graph.
 ///
-/// The generator type is a phantom parameter behind a function pointer, so the
+/// The generator type is carried by the term repository this store replays
+/// through, itself a phantom parameter behind a function pointer — so the
 /// store's own auto traits do not depend on `G`.
 #[derive(Debug, Clone)]
 pub struct LineageStore<G> {
     store: Store,
-    generator: PhantomData<fn() -> G>,
+    /// A run's endpoints are terms, and replaying one starts from the term its
+    /// `start` column addresses.
+    terms: TermStore<G>,
 }
 
 impl<G> LineageStore<G> {
@@ -370,10 +372,8 @@ impl<G> LineageStore<G> {
     ///
     /// Fails if a schema cannot be defined or does not verify.
     pub async fn open(store: Store) -> Result<Self> {
-        let repository = Self {
-            store,
-            generator: PhantomData,
-        };
+        let terms = TermStore::open(store.clone()).await?;
+        let repository = Self { store, terms };
         repository.bootstrap().await?;
         Ok(repository)
     }
@@ -625,6 +625,44 @@ where
             )
             .await?;
         Ok(addr)
+    }
+
+    /// Replay a run's trace and return the morphism it re-derives.
+    ///
+    /// The start term is loaded by the run's `start` address and the rules are
+    /// rebuilt from the run's rule set through `RewriteRule::new`, in the order
+    /// they were stored — which is the order a trace's rule indices are
+    /// relative to. Both are revalidated on the way, like any other load.
+    ///
+    /// The result is the endpoint the steps compose to, not a claim that it
+    /// equals the run's `best` column: a trace replayed against a start or a
+    /// rule set that is not the one it was recorded from can be a legal
+    /// derivation of something else.
+    ///
+    /// # Errors
+    ///
+    /// - [`StoreError::Corrupt`] if the run's `start` term or its rule set is
+    ///   not stored, or if a step column is not an index.
+    /// - [`StoreError::Catgraph`] if the steps are not a derivation — naming
+    ///   the step that failed.
+    /// - a database error, or a revalidation failure on either load.
+    pub async fn replay_run(&self, run: &RunRecord) -> Result<ColoredExpr<G>> {
+        let start = self
+            .terms
+            .get(run.start())
+            .await?
+            .ok_or_else(|| StoreError::Corrupt {
+                context: format!("{REWRITE_RUN_TABLE}:{}", run.addr()),
+                detail: format!("the run's `start` term `{}` is not stored", run.start()),
+            })?;
+        let rules =
+            self.get_rule_set(run.rule_set())
+                .await?
+                .ok_or_else(|| StoreError::Corrupt {
+                    context: format!("{REWRITE_RUN_TABLE}:{}", run.addr()),
+                    detail: format!("the run's rule set `{}` is not stored", run.rule_set()),
+                })?;
+        run.replay(&start, &rules)
     }
 
     /// Store the endpoint terms, in one statement.
