@@ -169,17 +169,24 @@ fn fixture() -> Fixture {
     }
 }
 
-/// Write one of everything.
-async fn populate(store: &Store, fixture: &Fixture) {
+/// The content addresses `populate` wrote to the term and cospan tables, each
+/// sorted and deduplicated.
+struct Written {
+    terms: Vec<String>,
+    cospans: Vec<String>,
+}
+
+/// Write one of everything, returning the term and cospan addresses written.
+async fn populate(store: &Store, fixture: &Fixture) -> Written {
     let terms = TermStore::<Gen>::open(store.clone())
         .await
         .expect("opening the term store");
-    terms.put(&copy_then_add()).await.expect("storing a term");
+    let term_addr = terms.put(&copy_then_add()).await.expect("storing a term");
 
     let cospans = CospanStore::<usize>::open(store.clone())
         .await
         .expect("opening the cospan store");
-    cospans
+    let cospan_addr = cospans
         .put(&fixture.cospan)
         .await
         .expect("storing a cospan");
@@ -215,6 +222,16 @@ async fn populate(store: &Store, fixture: &Fixture) {
         .record_run(&rule_set, &start, &outcome, "unit")
         .await
         .expect("recording a run");
+    // `record_run` also writes the run's two endpoint terms.
+    let run = catgraph_surreal::lineage::encode_run(&rule_set, &start, &outcome, "unit")
+        .expect("encoding the run");
+    let mut written_terms = vec![
+        term_addr.as_str().to_owned(),
+        run.start().as_str().to_owned(),
+        run.best().as_str().to_owned(),
+    ];
+    written_terms.sort();
+    written_terms.dedup();
 
     let docs = DocStore::<Snapshot>::open(store.clone())
         .await
@@ -238,6 +255,11 @@ async fn populate(store: &Store, fixture: &Fixture) {
         bus.publish("goals", &serde_json::json!({ "generation": generation }))
             .await
             .expect("publishing");
+    }
+
+    Written {
+        terms: written_terms,
+        cospans: vec![cospan_addr.as_str().to_owned()],
     }
 }
 
@@ -465,7 +487,7 @@ async fn every_tier_survives_a_checkpoint_and_a_restore() {
 async fn restored_content_addresses_are_re_verified_rather_than_trusted() {
     let fixture = fixture();
     let source = connect("roundtrip_verify_source").await;
-    populate(&source, &fixture).await;
+    let written = populate(&source, &fixture).await;
 
     let file = tempfile::NamedTempFile::new().expect("a temporary file");
     source
@@ -490,8 +512,16 @@ async fn restored_content_addresses_are_re_verified_rather_than_trusted() {
     let terms = TermStore::<Gen>::open(restored.clone())
         .await
         .expect("opening the term store");
-    for addr in ids(&restored, schema::TERM_TABLE).await {
-        let addr = catgraph_surreal::TermAddr::parse(&addr)
+    let mut term_ids = ids(&restored, schema::TERM_TABLE).await;
+    term_ids.sort();
+    assert_eq!(
+        term_ids,
+        written.terms,
+        "the restored `{}` ids (left) are not exactly the addresses populate wrote (right)",
+        schema::TERM_TABLE
+    );
+    for addr in &term_ids {
+        let addr = catgraph_surreal::TermAddr::parse(addr)
             .expect("a restored term id has the address shape");
         terms
             .get(&addr)
@@ -504,8 +534,16 @@ async fn restored_content_addresses_are_re_verified_rather_than_trusted() {
     let cospans = CospanStore::<usize>::open(restored.clone())
         .await
         .expect("opening the cospan store");
-    for addr in ids(&restored, schema::COSPAN_TABLE).await {
-        let addr = catgraph_surreal::CospanAddr::parse(&addr)
+    let mut cospan_ids = ids(&restored, schema::COSPAN_TABLE).await;
+    cospan_ids.sort();
+    assert_eq!(
+        cospan_ids,
+        written.cospans,
+        "the restored `{}` ids (left) are not exactly the addresses populate wrote (right)",
+        schema::COSPAN_TABLE
+    );
+    for addr in &cospan_ids {
+        let addr = catgraph_surreal::CospanAddr::parse(addr)
             .expect("a restored cospan id has the address shape");
         cospans
             .get(&addr)
