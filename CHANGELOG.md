@@ -4,6 +4,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
 [SemVer](https://semver.org/spec/v2.0.0.html). Each version is a git tag; the
 crate is not published.
 
+## [0.3.0] - 2026-09-22
+
+### Added
+
+- Span tier: `SpanStore<L>` (`open`, `bootstrap`, `assert_schema`, `contains`,
+  `put`, `put_many`, `get`, `find_by_canon`), `SpanRecord`, `SpanAddr`, and the
+  `span` module (`SPAN_CODEC = "cgsp1"`, `encode`, `canon_key`, `address_of`).
+  Table `span`; the record id addresses the presentation `(dom, cod, mid_dom,
+  mid_cod)`; `canon_key` digests the boundaries and the sorted middle pairs and
+  is `UNIQUE` (index `span_canon`). A second presentation of a stored morphism
+  is refused with `StoreError::Duplicate`. Loads revalidate every column and
+  rebuild through `Span::new`.
+- `schema::{bootstrap_spans, assert_span_schema}` and the `SPAN_*` schema
+  constants.
+
 ## [0.2.0] - 2026-09-13
 
 ### Changed — BREAKING

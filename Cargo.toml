@@ -1,6 +1,6 @@
 [package]
 name = "catgraph-surreal"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # Measured, not guessed: the cross-feature maximum over the resolved dependency
 # graph (see README "MSRV"). Re-measure whenever a dependency moves.
@@ -96,9 +96,11 @@ blake3 = "1"
 # terms, it does not interpret them), and a test asserts the two stay in
 # agreement so an upstream change fails CI instead of silently diverging.
 catgraph-syntax = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.23.0", default-features = false }
-# The canonical-key equivalence gate: `store_key(a) == store_key(b)` if and only
-# if `a.canonical_form() == b.canonical_form()`, over generated cospans. Both
-# directions matter, and neither is provable by a handful of examples.
+# The canonical-key equivalence gates: over generated cospans, `store_key(a) ==
+# store_key(b)` if and only if `a.canonical_form() == b.canonical_form()`; over
+# generated spans, `canon_key(a) == canon_key(b)` if and only if a brute-force
+# search finds an apex bijection commuting with both legs. Both directions
+# matter, and neither is provable by a handful of examples.
 proptest = "1"
 # The persistent engines lock their data directory, so every test that opens one
 # needs a directory of its own — sharing one would serialise the suite at best
@@ -110,8 +112,8 @@ tempfile = "3"
 futures = "0.3"
 
 # Turns catgraph's `debug_assert!`s off in the test profile. That is what lets a
-# test build an out-of-bounds `Cospan` through `Cospan::new_unchecked` — which
-# `debug_assert!`s the leg bounds — and drive it into `cospan::encode`, where
-# this store's own refusal is the thing under test.
+# test build an out-of-bounds `Cospan` or `Span` through `new_unchecked` — which
+# `debug_assert!`s the bounds — and drive it into `cospan::encode` or
+# `span::encode`, where this store's own refusal is the thing under test.
 [profile.test.package.catgraph]
 debug-assertions = false

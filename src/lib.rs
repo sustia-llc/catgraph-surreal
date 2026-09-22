@@ -1,7 +1,7 @@
 //! SurrealDB persistence for catgraph's category-theoretic structures.
 //!
 //! This crate stores and reloads the structures catgraph builds — terms, cospans,
-//! parameter weights — in SurrealDB, embedded or over a server connection.
+//! spans, parameter weights — in SurrealDB, embedded or over a server connection.
 //!
 //! # Status
 //!
@@ -16,6 +16,7 @@
 //! |---|---|
 //! | [terms](term_store) | Content-addressed `ColoredExpr`s, revalidated on load |
 //! | [cospans](cospan_store) | Presentations, with a complete canonical key |
+//! | [spans](span_store) | Presentations, with a complete canonical key |
 //! | [weights](weight_store) | Coordinate vectors on a bit-exact byte lane |
 //! | [lineage](lineage_store) | Rule sets, optimizer traces, and the derivation graph |
 //! | [documents](doc_store) | Consumer-shaped serde types, mutable or write-once |
@@ -105,13 +106,15 @@ pub mod lineage;
 pub mod lineage_store;
 pub mod retry;
 pub mod schema;
+pub mod span;
+pub mod span_store;
 pub mod store;
 pub mod term;
 pub mod term_store;
 pub mod weight;
 pub mod weight_store;
 
-pub use addr::{BusAddr, CospanAddr, DerivationAddr, RuleSetAddr, RunAddr, TermAddr};
+pub use addr::{BusAddr, CospanAddr, DerivationAddr, RuleSetAddr, RunAddr, SpanAddr, TermAddr};
 pub use bus::BusEvent;
 pub use bus_store::{BusReader, BusStream, BusWriter};
 pub use capability::{Capability, EndpointCapabilities, Requirements};
@@ -124,6 +127,8 @@ pub use error::{Result, RevalidationStage, StoreError};
 pub use lineage::{DerivationRecord, RuleSetRecord, RunRecord, TraceStep};
 pub use lineage_store::LineageStore;
 pub use retry::{RetryPolicy, retry};
+pub use span::SpanRecord;
+pub use span_store::SpanStore;
 pub use store::{Store, StoreBuilder};
 pub use term::TermRecord;
 pub use term_store::TermStore;

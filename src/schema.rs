@@ -86,8 +86,8 @@
 //! So the `READONLY` columns, the write-once events, and the id-format `ASSERT`
 //! do not *guarantee* anything: the store's own validation is the trust boundary
 //! and the database backs it up. This is why [`crate::term`]'s revalidation runs
-//! on every load, why [`crate::cospan`] bounds-checks every leg it reads, and
-//! why a restore re-verifies record ids rather than trusting the replay.
+//! on every load, why [`crate::cospan`] and [`crate::span`] bounds-check every
+//! leg they read, and why a restore re-verifies record ids rather than trusting the replay.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -383,6 +383,147 @@ const COSPAN_SCHEMA: TableSchema = TableSchema {
     nested_fields: &[],
     implicit_fields: &COSPAN_ELEMENT_DEFINITIONS,
     indexes: &COSPAN_INDEX_DEFINITIONS,
+    events: &[],
+    write_once: true,
+};
+
+// ---------------------------------------------------------------------- spans
+
+/// The table holding content-addressed span presentations.
+pub const SPAN_TABLE: &str = "span";
+
+/// Every column the [`SPAN_TABLE`] schema declares, in DDL order.
+///
+/// The boundaries are `array<string>` (encoded labels) and the middle pairs are
+/// two parallel `array<int>` columns, `mid_dom[i]` and `mid_cod[i]` being the
+/// two components of apex element `i` (see [`crate::span`]).
+pub const SPAN_FIELDS: [&str; 10] = [
+    "id",
+    "codec",
+    "dom",
+    "cod",
+    "mid_dom",
+    "mid_cod",
+    "dom_len",
+    "cod_len",
+    "apex_len",
+    "canon_key",
+];
+
+/// The unique index on a span's canonical key.
+///
+/// A span's canonical key is a complete invariant for equality of morphisms,
+/// so two rows sharing a key are two presentations of one morphism.
+pub const SPAN_CANON_INDEX: &str = "span_canon";
+
+/// Every index the [`SPAN_TABLE`] schema declares.
+pub const SPAN_INDEXES: [&str; 1] = [SPAN_CANON_INDEX];
+
+/// The span table's own definition, as the engine renders it.
+pub const SPAN_TABLE_DEFINITION: &str = "DEFINE TABLE span TYPE NORMAL SCHEMAFULL PERMISSIONS NONE";
+
+/// Every column's definition, as the engine renders it.
+pub const SPAN_FIELD_DEFINITIONS: [(&str, &str); 10] = [
+    (
+        "id",
+        "DEFINE FIELD id ON span TYPE string ASSERT record::id($value) = /^b3_[0-9a-f]{64}$/ PERMISSIONS FULL",
+    ),
+    (
+        "codec",
+        "DEFINE FIELD codec ON span TYPE string READONLY PERMISSIONS FULL",
+    ),
+    (
+        "dom",
+        "DEFINE FIELD dom ON span TYPE array<string> READONLY PERMISSIONS FULL",
+    ),
+    (
+        "cod",
+        "DEFINE FIELD cod ON span TYPE array<string> READONLY PERMISSIONS FULL",
+    ),
+    (
+        "mid_dom",
+        "DEFINE FIELD mid_dom ON span TYPE array<int> READONLY PERMISSIONS FULL",
+    ),
+    (
+        "mid_cod",
+        "DEFINE FIELD mid_cod ON span TYPE array<int> READONLY PERMISSIONS FULL",
+    ),
+    (
+        "dom_len",
+        "DEFINE FIELD dom_len ON span TYPE int READONLY PERMISSIONS FULL",
+    ),
+    (
+        "cod_len",
+        "DEFINE FIELD cod_len ON span TYPE int READONLY PERMISSIONS FULL",
+    ),
+    (
+        "apex_len",
+        "DEFINE FIELD apex_len ON span TYPE int READONLY PERMISSIONS FULL",
+    ),
+    (
+        "canon_key",
+        "DEFINE FIELD canon_key ON span TYPE string READONLY PERMISSIONS FULL",
+    ),
+];
+
+/// The element definitions the engine creates for the `array<T>` columns above,
+/// as it renders them.
+///
+/// These are compared by the drift guard but are not projectable columns; the
+/// parent column's `READONLY` refuses an element write.
+pub const SPAN_ELEMENT_DEFINITIONS: [(&str, &str); 4] = [
+    (
+        "dom.*",
+        "DEFINE FIELD dom.* ON span TYPE string PERMISSIONS FULL",
+    ),
+    (
+        "cod.*",
+        "DEFINE FIELD cod.* ON span TYPE string PERMISSIONS FULL",
+    ),
+    (
+        "mid_dom.*",
+        "DEFINE FIELD mid_dom.* ON span TYPE int PERMISSIONS FULL",
+    ),
+    (
+        "mid_cod.*",
+        "DEFINE FIELD mid_cod.* ON span TYPE int PERMISSIONS FULL",
+    ),
+];
+
+/// Every declared index's definition, as the engine renders it.
+pub const SPAN_INDEX_DEFINITIONS: [(&str, &str); 1] = [(
+    SPAN_CANON_INDEX,
+    "DEFINE INDEX span_canon ON span FIELDS canon_key UNIQUE",
+)];
+
+/// The span table's DDL.
+const SPAN_DDL: &str = "\
+DEFINE TABLE IF NOT EXISTS span SCHEMAFULL TYPE NORMAL;
+
+DEFINE FIELD IF NOT EXISTS id ON span TYPE string
+    ASSERT record::id($value) = /^b3_[0-9a-f]{64}$/;
+DEFINE FIELD IF NOT EXISTS codec ON span TYPE string READONLY;
+DEFINE FIELD IF NOT EXISTS dom ON span TYPE array<string> READONLY;
+DEFINE FIELD IF NOT EXISTS cod ON span TYPE array<string> READONLY;
+DEFINE FIELD IF NOT EXISTS mid_dom ON span TYPE array<int> READONLY;
+DEFINE FIELD IF NOT EXISTS mid_cod ON span TYPE array<int> READONLY;
+DEFINE FIELD IF NOT EXISTS dom_len ON span TYPE int READONLY;
+DEFINE FIELD IF NOT EXISTS cod_len ON span TYPE int READONLY;
+DEFINE FIELD IF NOT EXISTS apex_len ON span TYPE int READONLY;
+DEFINE FIELD IF NOT EXISTS canon_key ON span TYPE string READONLY;
+
+DEFINE INDEX IF NOT EXISTS span_canon ON span FIELDS canon_key UNIQUE;
+";
+
+/// The span table's schema, as this build declares it.
+const SPAN_SCHEMA: TableSchema = TableSchema {
+    table: SPAN_TABLE,
+    ddl: Cow::Borrowed(SPAN_DDL),
+    table_definition: Cow::Borrowed(SPAN_TABLE_DEFINITION),
+    fields: &SPAN_FIELD_DEFINITIONS,
+    nested_fields: &[],
+    implicit_fields: &SPAN_ELEMENT_DEFINITIONS,
+    indexes: &SPAN_INDEX_DEFINITIONS,
     events: &[],
     write_once: true,
 };
@@ -1434,6 +1575,29 @@ pub async fn assert_cospan_schema(client: &Surreal<Any>) -> Result<()> {
     assert_schema(client, &COSPAN_SCHEMA).await
 }
 
+/// Define the span table, its columns, and its unique canonical-key index.
+///
+/// Idempotent, and verified — see [`bootstrap_terms`].
+///
+/// # Errors
+///
+/// Fails if any statement is rejected, or if the resulting schema does not
+/// match what this version declares.
+pub async fn bootstrap_spans(client: &Surreal<Any>) -> Result<()> {
+    bootstrap(client, &SPAN_SCHEMA).await
+}
+
+/// Check the live span schema against what this version of the store
+/// declares. See [`assert_term_schema`].
+///
+/// # Errors
+///
+/// Returns [`StoreError::Schema`] naming the difference, or a database error if
+/// the schema could not be read.
+pub async fn assert_span_schema(client: &Surreal<Any>) -> Result<()> {
+    assert_schema(client, &SPAN_SCHEMA).await
+}
+
 /// Define the weight table, its columns, and its unique key index.
 ///
 /// Idempotent, and verified — see [`bootstrap_terms`].
@@ -1671,6 +1835,7 @@ mod tests {
         vec![
             TERM_SCHEMA,
             COSPAN_SCHEMA,
+            SPAN_SCHEMA,
             WEIGHT_SCHEMA,
             RULE_SET_SCHEMA,
             REWRITE_RUN_SCHEMA,
@@ -1738,6 +1903,7 @@ mod tests {
         for (names, definitions) in [
             (&TERM_FIELDS[..], &TERM_FIELD_DEFINITIONS[..]),
             (&COSPAN_FIELDS[..], &COSPAN_FIELD_DEFINITIONS[..]),
+            (&SPAN_FIELDS[..], &SPAN_FIELD_DEFINITIONS[..]),
             (&WEIGHT_FIELDS[..], &WEIGHT_FIELD_DEFINITIONS[..]),
             (&RULE_SET_FIELDS[..], &RULE_SET_FIELD_DEFINITIONS[..]),
             (&REWRITE_RUN_FIELDS[..], &REWRITE_RUN_FIELD_DEFINITIONS[..]),
@@ -1754,6 +1920,7 @@ mod tests {
         for (names, definitions) in [
             (&TERM_INDEXES[..], &TERM_INDEX_DEFINITIONS[..]),
             (&COSPAN_INDEXES[..], &COSPAN_INDEX_DEFINITIONS[..]),
+            (&SPAN_INDEXES[..], &SPAN_INDEX_DEFINITIONS[..]),
             (&WEIGHT_INDEXES[..], &WEIGHT_INDEX_DEFINITIONS[..]),
             (&REWRITE_RUN_INDEXES[..], &REWRITE_RUN_INDEX_DEFINITIONS[..]),
             (&DERIVES_INDEXES[..], &DERIVES_INDEX_DEFINITIONS[..]),
