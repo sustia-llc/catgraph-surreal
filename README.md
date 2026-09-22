@@ -1,7 +1,7 @@
 # catgraph-surreal
 
 SurrealDB persistence for [catgraph](https://github.com/sustia-llc/catgraph)'s
-category-theoretic structures — terms, cospans, parameter weights, rewrite
+category-theoretic structures — terms, cospans, spans, parameter weights, rewrite
 lineage — plus a consumer-shaped document tier and a durable notification bus,
 embedded or over a server connection.
 
@@ -15,6 +15,7 @@ embedded or over a server connection.
 |---|---|
 | [Terms](#terms) | Content-addressed `ColoredExpr`s, revalidated on load |
 | [Cospans](#cospans) | Presentations, with a complete canonical key |
+| [Spans](#spans) | Presentations, with a complete canonical key |
 | [Weights](#weights) | Coordinate vectors on a bit-exact byte lane |
 | [Lineage](#lineage) | Rule sets, optimizer traces, and the derivation graph |
 | [Documents](#documents) | Consumer-shaped serde types, mutable or write-once |
@@ -153,6 +154,31 @@ legs against the apex in every build profile, but `Cospan::new_unchecked` and
 release build accepts an out-of-bounds leg through either. This store
 bounds-checks on write, so such a value never reaches disk, and on load, where
 it arrives as a tampered column.
+
+## Spans
+
+`SpanStore` keeps catgraph's `Span` under the same two-identity contract as
+cospans.
+
+**A span's record id is the content address of its *presentation*** — the two
+boundaries' encoded labels (`dom`, `cod`) and the middle pairs, stored as two
+parallel integer arrays (`mid_dom[i]`, `mid_cod[i]` for apex element `i`), in
+the order the caller built them.
+
+**The `canon_key` column is the *morphism's* identity, and it is `UNIQUE`.** It
+is the digest of the encoded boundaries and the middle pairs sorted ascending. A
+span's apex carries no labels of its own, so two parallel spans are related by a
+bijection of apexes commuting with both legs exactly when their sorted pair
+lists are equal — the key is a **complete** invariant. As with cospans, writing
+a second presentation of an already-stored morphism is refused with
+`StoreError::Duplicate`, and `find_by_canon` returns the stored presentation's
+address. A proptest checks key equality against a brute-force search for an
+apex bijection, in both directions.
+
+`Span::new` checks every middle pair's bounds and label agreement in every build
+profile, but `Span::new_unchecked` checks them only under `debug_assert!`. This
+store checks every pair on write, so an out-of-bounds or label-disagreeing pair
+never reaches disk, and on load, where it arrives as a tampered column.
 
 ## Weights
 

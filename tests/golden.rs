@@ -11,7 +11,7 @@
 //!
 //! These vectors are the tripwire. If one fails and the change was
 //! intentional, bump the affected codec tag (`TERM_CODEC`, `COSPAN_CODEC`,
-//! `WEIGHT_CODEC`, `RULE_SET_CODEC`, `REWRITE_RUN_CODEC`, `DERIVATION_CODEC`,
+//! `SPAN_CODEC`, `WEIGHT_CODEC`, `RULE_SET_CODEC`, `REWRITE_RUN_CODEC`, `DERIVATION_CODEC`,
 //! `DOCUMENT_CODEC`, `BUS_CODEC`) and re-pin the vector **in the same commit** —
 //! that is what the tags exist for. If the change was not intentional, a
 //! dependency just moved the on-disk format out from under the store.
@@ -27,10 +27,11 @@
 use std::borrow::Cow;
 
 use catgraph::cospan::Cospan;
+use catgraph::span::Span;
 use catgraph_applied::prop::colored::ColoredExpr;
 use catgraph_applied::prop::presentation::rewrite::{RewriteRule, optimize};
 use catgraph_applied::prop::{Free, PropSignature};
-use catgraph_surreal::{bus, cospan, doc, lineage, term, weight};
+use catgraph_surreal::{bus, cospan, doc, lineage, span, term, weight};
 use serde::{Deserialize, Serialize};
 
 /// The fixture signature: four unit variants, derived serde, one color.
@@ -98,6 +99,22 @@ fn cospan_identity_is_pinned_to_exact_bytes() {
         (
             "b3_c1693380253896f7f36ecefe6232e659971ada00756cd8775268973f9492f6fc",
             "b3_9f5e9818e8971f77630b264110ddb989330cc0b1ce5561b91d42815efe81c4cd",
+        )
+    );
+}
+
+#[test]
+fn span_identity_is_pinned_to_exact_bytes() {
+    // Two domain nodes onto one codomain node, pairs listed out of order.
+    let fixture = Span::new(vec![3usize, 3], vec![3], vec![(1, 0), (0, 0)])
+        .expect("the fixture's pairs are valid");
+    let record = span::encode(&fixture).expect("the fixture encodes");
+    assert_eq!(record.codec(), "cgsp1");
+    assert_eq!(
+        (record.addr().as_str(), record.canon_key()),
+        (
+            "b3_ae82f8a6a3b2387fdf9df2ba4a18027717e309094ea536dce6c1846d18872b4b",
+            "b3_9a32f0e2747dbcb9e32c4906843027a090c16c9cf322ce9d7823dee13eeebbaf",
         )
     );
 }

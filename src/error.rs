@@ -174,7 +174,9 @@ pub enum StoreError {
     /// A value violates an invariant no constructor checked: on load, a
     /// column read off disk (leg bounds, derived sizes, content addresses hold
     /// only by re-derivation); on write, a cospan leg pointing outside its
-    /// apex. Reported rather than handed to an interpreter that panics later.
+    /// apex, or a span pair pointing outside a boundary or naming two
+    /// disagreeing labels. Reported rather than handed to an interpreter that
+    /// panics later.
     #[error("corrupt document in {context}: {detail}")]
     Corrupt {
         /// The structure or record the corruption was found in.
@@ -231,12 +233,13 @@ pub enum StoreError {
     /// under a different id.
     ///
     /// This is not a conflict and not corruption — it is the database enforcing
-    /// an identity the store declared. The cospan tier raises it when a second
-    /// *presentation* of an already-stored morphism is written: the two rows
-    /// have different content addresses but one canonical key, and the store
-    /// keeps one presentation per morphism. Recovering the address of the
+    /// an identity the store declared. The cospan and span tiers raise it when a
+    /// second *presentation* of an already-stored morphism is written: the two
+    /// rows have different content addresses but one canonical key, and the
+    /// store keeps one presentation per morphism. Recovering the address of the
     /// presentation that is already there is a read, not a retry —
-    /// [`CospanStore::find_by_canon`](crate::CospanStore::find_by_canon).
+    /// [`CospanStore::find_by_canon`](crate::CospanStore::find_by_canon) or
+    /// [`SpanStore::find_by_canon`](crate::SpanStore::find_by_canon).
     #[error(
         "`{table}` already holds an equivalent record; the unique index `{index}` refused the write"
     )]

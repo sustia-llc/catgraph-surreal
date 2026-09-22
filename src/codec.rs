@@ -41,12 +41,12 @@ use std::hash::Hash;
 ///
 /// This is not a politeness: it makes `encode` **injective** — two distinct
 /// labels can never share an encoding — and injectivity is exactly what the
-/// cospan tier's completeness argument stands on. Its canonical key is built
-/// from *encoded* labels, and "equal keys ⇒ equal morphisms" holds only if
-/// distinct labels stay distinct after encoding. An implementation that
+/// cospan and span tiers' completeness arguments stand on. Their canonical keys
+/// are built from *encoded* labels, and "equal keys ⇒ equal morphisms" holds
+/// only if distinct labels stay distinct after encoding. An implementation that
 /// violates the law (say, two enum variants encoding to one string) makes the
 /// `UNIQUE` key column refuse genuinely new morphisms as duplicates and makes
-/// `find_by_canon` answer with unrelated cospans — with no error anywhere
+/// `find_by_canon` answer with unrelated morphisms — with no error anywhere
 /// naming this trait. Pin the law with a round-trip test over your label type,
 /// the way the integer implementations below do.
 ///

@@ -40,16 +40,17 @@
 use std::borrow::Cow;
 
 use catgraph::cospan::Cospan;
+use catgraph::span::Span;
 use catgraph_applied::prop::colored::ColoredExpr;
 use catgraph_applied::prop::presentation::rewrite::{RewriteRule, optimize};
 use catgraph_applied::prop::{Free, PropSignature};
 use catgraph_dl::para::RModule;
 use catgraph_surreal::{
-    BusReader, BusWriter, CospanStore, DocStore, LineageStore, ManifestStore, Store, StoreBuilder,
-    TermStore, WeightStore, cospan, schema, term, weight,
+    BusReader, BusWriter, CospanStore, DocStore, LineageStore, ManifestStore, SpanStore, Store,
+    StoreBuilder, TermStore, WeightStore, cospan, schema, span, term, weight,
 };
 use serde::{Deserialize, Serialize};
-use surrealdb::types::RecordId;
+use surrealdb::types::{RecordId, SurrealValue};
 
 /// Every table a checkpoint carries, named explicitly.
 ///
@@ -58,9 +59,10 @@ use surrealdb::types::RecordId;
 /// exports everything; and a rollup view in a full dump fails on replay, because
 /// a replayed `DEFINE TABLE … AS SELECT` materialises immediately. Naming the
 /// source tables sidesteps both.
-const CHECKPOINT_TABLES: [&str; 10] = [
+const CHECKPOINT_TABLES: [&str; 11] = [
     schema::TERM_TABLE,
     schema::COSPAN_TABLE,
+    schema::SPAN_TABLE,
     schema::WEIGHT_TABLE,
     schema::RULE_SET_TABLE,
     schema::REWRITE_RUN_TABLE,
@@ -144,6 +146,7 @@ async fn connect(database: &str) -> Store {
 /// something to compare against.
 struct Fixture {
     cospan: Cospan<usize>,
+    span: Span<usize>,
     weights: RModule<f64>,
     snapshot: Snapshot,
     manifest: serde_json::Value,
@@ -154,6 +157,9 @@ fn fixture() -> Fixture {
         // A μ-shape with a scalar: two domain wires onto one apex vertex, one
         // codomain wire, one untouched vertex.
         cospan: Cospan::new(vec![0, 0], vec![0], vec![3usize, 9]).expect("μ's legs are in bounds"),
+        // Two domain nodes onto one codomain node, pairs listed out of order.
+        span: Span::new(vec![3usize, 3], vec![3], vec![(1, 0), (0, 0)])
+            .expect("the span's pairs are valid"),
         weights: awkward_weights(),
         snapshot: Snapshot {
             beliefs: vec![0.25, 0.5, 0.25],
@@ -177,6 +183,11 @@ async fn populate(store: &Store, fixture: &Fixture) {
         .put(&fixture.cospan)
         .await
         .expect("storing a cospan");
+
+    let spans = SpanStore::<usize>::open(store.clone())
+        .await
+        .expect("opening the span store");
+    spans.put(&fixture.span).await.expect("storing a span");
 
     let weights = WeightStore::open(store.clone())
         .await
@@ -241,6 +252,9 @@ async fn bootstrap_all(store: &Store) {
     CospanStore::<usize>::open(store.clone())
         .await
         .expect("cospans");
+    SpanStore::<usize>::open(store.clone())
+        .await
+        .expect("spans");
     WeightStore::open(store.clone()).await.expect("weights");
     LineageStore::<Gen>::open(store.clone())
         .await
@@ -317,6 +331,30 @@ async fn every_tier_survives_a_checkpoint_and_a_restore() {
             .await
             .expect("looking up by canonical key"),
         Some(cospan_addr)
+    );
+
+    // --- spans: the presentation and the canonical key both survive.
+    let spans = SpanStore::<usize>::open(restored.clone())
+        .await
+        .expect("opening the span store");
+    let span_addr = span::encode(&fixture.span)
+        .expect("encoding")
+        .addr()
+        .clone();
+    let loaded = spans
+        .get(&span_addr)
+        .await
+        .expect("loading a restored span")
+        .expect("it is present");
+    assert_eq!(loaded.left(), fixture.span.left());
+    assert_eq!(loaded.right(), fixture.span.right());
+    assert_eq!(loaded.middle_pairs(), fixture.span.middle_pairs());
+    assert_eq!(
+        spans
+            .find_by_canon(&fixture.span)
+            .await
+            .expect("looking up by canonical key"),
+        Some(span_addr)
     );
 
     // --- weights: bit for bit, which is the whole reason for the byte lane.
@@ -476,6 +514,46 @@ async fn restored_content_addresses_are_re_verified_rather_than_trusted() {
             .unwrap_or_else(|| panic!("restored cospan `{addr}` vanished"));
     }
 
+    // Spans: same through `get`, and the id is also re-derived directly from
+    // the presentation columns with `span::address_of`.
+    let spans = SpanStore::<usize>::open(restored.clone())
+        .await
+        .expect("opening the span store");
+    let span_ids = ids(&restored, schema::SPAN_TABLE).await;
+    let expected_span = span::encode(&fixture.span)
+        .expect("encoding")
+        .addr()
+        .as_str()
+        .to_owned();
+    assert_eq!(
+        span_ids,
+        vec![expected_span],
+        "the restore carries exactly the one span row"
+    );
+    for addr in &span_ids {
+        let addr = catgraph_surreal::SpanAddr::parse(addr)
+            .expect("a restored span id has the address shape");
+        spans
+            .get(&addr)
+            .await
+            .unwrap_or_else(|e| panic!("restored span `{addr}` does not verify: {e}"))
+            .unwrap_or_else(|| panic!("restored span `{addr}` vanished"));
+    }
+    let presentations = span_presentations(&restored).await;
+    assert_eq!(presentations.len(), 1, "one restored span presentation");
+    for row in presentations {
+        let surrealdb::types::RecordIdKey::String(key) = &row.id.key else {
+            panic!("a stored span id is not a string key");
+        };
+        let derived = span::address_of(&row.dom, &row.cod, &row.mid_dom, &row.mid_cod)
+            .expect("a presentation is addressable");
+        assert_eq!(
+            derived.as_str(),
+            key,
+            "restored span filed under an id its presentation does not derive"
+        );
+    }
+
     // Weights: the key is re-derived from the pair the row itself carries.
     let weights = WeightStore::open(restored.clone())
         .await
@@ -592,6 +670,29 @@ async fn a_restore_emits_no_change_feed_entries() {
     let batch = reader.next_batch().await.expect("catching up");
     assert_eq!(batch.len(), 1);
     assert_eq!(batch[0].seq(), 3, "the allocator survived the restore too");
+}
+
+/// A span row's id and presentation columns.
+#[derive(Debug, Clone, SurrealValue)]
+struct SpanPresentation {
+    id: RecordId,
+    dom: Vec<String>,
+    cod: Vec<String>,
+    mid_dom: Vec<i64>,
+    mid_cod: Vec<i64>,
+}
+
+/// Every span row's id and presentation columns.
+async fn span_presentations(store: &Store) -> Vec<SpanPresentation> {
+    let mut response = store
+        .client()
+        .query(format!(
+            "SELECT id, dom, cod, mid_dom, mid_cod FROM {}",
+            schema::SPAN_TABLE
+        ))
+        .await
+        .expect("listing the span presentations");
+    response.take(0).expect("the presentations read back")
 }
 
 /// Every record id in a table, as the strings they are stored under.

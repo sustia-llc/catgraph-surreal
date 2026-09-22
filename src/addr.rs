@@ -194,6 +194,17 @@ content_address! {
     CospanAddr
 }
 
+content_address! {
+    /// An opaque handle to a stored span.
+    ///
+    /// The address is a content address of the span's *presentation* — its two
+    /// labelled boundaries and its middle pairs, in the order the caller built
+    /// them. Two presentations of the same morphism therefore have different
+    /// addresses; what identifies them as one morphism is the canonical key
+    /// (see [`crate::span`]), which is a separate, uniquely-indexed column.
+    SpanAddr
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +281,19 @@ mod tests {
         assert_eq!(CospanAddr::from_digest(&DIGEST.to_uppercase()), None);
         assert_eq!(CospanAddr::parse(DIGEST), None);
         assert_eq!(CospanAddr::parse(""), None);
+    }
+
+    #[test]
+    fn span_addresses_validate_exactly_as_term_addresses_do() {
+        let addr = SpanAddr::from_digest(DIGEST).expect("64 lowercase hex chars is a valid digest");
+        assert_eq!(addr.as_str(), format!("b3_{DIGEST}"));
+        assert_eq!(addr.digest(), DIGEST);
+        assert_eq!(SpanAddr::parse(addr.as_str()), Some(addr));
+
+        assert_eq!(SpanAddr::from_digest(&DIGEST[..63]), None);
+        assert_eq!(SpanAddr::from_digest(&DIGEST.to_uppercase()), None);
+        assert_eq!(SpanAddr::parse(DIGEST), None);
+        assert_eq!(SpanAddr::parse(""), None);
     }
 
     /// Derived key columns share the address shape exactly, so a key can be
