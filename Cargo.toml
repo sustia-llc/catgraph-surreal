@@ -48,7 +48,7 @@ surrealdb = { version = "3.2.4", default-features = false }
 # the public `dim()`/`as_slice()`/`new()` surface) enters with the weight store;
 # declaring it ahead of any use would make every consumer fetch and compile it
 # for nothing.
-catgraph = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.23.0" }
+catgraph = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.24.0" }
 
 # The weight tier's payload type, `RModule<f64>`. `serde` is deliberately NOT
 # enabled: coordinates are persisted as raw IEEE-754 bytes through the public
@@ -56,7 +56,7 @@ catgraph = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.23.0" }
 # is not — `serde_json` turns every non-finite into `null` on the way out and
 # then fails to read it back. The crate declares no `default` feature, so
 # `default-features = false` says what is meant rather than changing anything.
-catgraph-dl = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.23.0", default-features = false }
+catgraph-dl = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.24.0", default-features = false }
 
 # The term tier's payload type. `serde` is required — it is what puts
 # `ColoredExpr`/`PropExpr` on the wire at all. `default-features = false` drops
@@ -64,7 +64,7 @@ catgraph-dl = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.23.0",
 # does arity walks and hashing, not the linear-combination and Temperley-Lieb
 # work those call sites accelerate, and the same dependency would have to build
 # on every target this crate checks, wasm included.
-catgraph-applied = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.23.0", default-features = false, features = [
+catgraph-applied = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.24.0", default-features = false, features = [
     "serde",
 ] }
 
@@ -95,7 +95,7 @@ blake3 = "1"
 # `term::term_depth` re-implement this crate's originals (the store persists
 # terms, it does not interpret them), and a test asserts the two stay in
 # agreement so an upstream change fails CI instead of silently diverging.
-catgraph-syntax = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.23.0", default-features = false }
+catgraph-syntax = { git = "https://github.com/sustia-llc/catgraph", tag = "v0.24.0", default-features = false }
 # The canonical-key equivalence gates: over generated cospans, `store_key(a) ==
 # store_key(b)` if and only if `a.canonical_form() == b.canonical_form()`; over
 # generated spans, `canon_key(a) == canon_key(b)` if and only if a brute-force
