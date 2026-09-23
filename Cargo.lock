@@ -551,8 +551,8 @@ dependencies = [
 
 [[package]]
 name = "catgraph"
-version = "0.24.0"
-source = "git+https://github.com/sustia-llc/catgraph?tag=v0.24.0#940dc70466e826f99335481034442386671c07e0"
+version = "0.25.0"
+source = "git+https://github.com/sustia-llc/catgraph?tag=v0.25.0#2859d93889645a641182fc9af145dda4e8b90420"
 dependencies = [
  "blake3",
  "either",
@@ -566,8 +566,8 @@ dependencies = [
 
 [[package]]
 name = "catgraph-applied"
-version = "0.24.0"
-source = "git+https://github.com/sustia-llc/catgraph?tag=v0.24.0#940dc70466e826f99335481034442386671c07e0"
+version = "0.25.0"
+source = "git+https://github.com/sustia-llc/catgraph?tag=v0.25.0#2859d93889645a641182fc9af145dda4e8b90420"
 dependencies = [
  "catgraph",
  "either",
@@ -583,8 +583,8 @@ dependencies = [
 
 [[package]]
 name = "catgraph-dl"
-version = "0.24.0"
-source = "git+https://github.com/sustia-llc/catgraph?tag=v0.24.0#940dc70466e826f99335481034442386671c07e0"
+version = "0.25.0"
+source = "git+https://github.com/sustia-llc/catgraph?tag=v0.25.0#2859d93889645a641182fc9af145dda4e8b90420"
 dependencies = [
  "catgraph-applied",
  "thiserror 2.0.20",
@@ -592,7 +592,7 @@ dependencies = [
 
 [[package]]
 name = "catgraph-surreal"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "blake3",
  "catgraph",
@@ -611,8 +611,8 @@ dependencies = [
 
 [[package]]
 name = "catgraph-syntax"
-version = "0.24.0"
-source = "git+https://github.com/sustia-llc/catgraph?tag=v0.24.0#940dc70466e826f99335481034442386671c07e0"
+version = "0.25.0"
+source = "git+https://github.com/sustia-llc/catgraph?tag=v0.25.0#2859d93889645a641182fc9af145dda4e8b90420"
 dependencies = [
  "catgraph",
  "catgraph-applied",
