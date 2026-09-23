@@ -969,6 +969,16 @@ mod tests {
         Add,
     }
 
+    /// One variant byte: `Copy` 0, `Add` 1.
+    impl catgraph::CanonicalEncode for Gen {
+        fn encode_canonical(&self, out: &mut Vec<u8>) {
+            out.push(match self {
+                Self::Copy => 0,
+                Self::Add => 1,
+            });
+        }
+    }
+
     impl PropSignature for Gen {
         type Color = ();
 

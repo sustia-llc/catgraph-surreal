@@ -4,6 +4,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follo
 [SemVer](https://semver.org/spec/v2.0.0.html). Each version is a git tag; the
 crate is not published.
 
+## [0.4.0] - 2026-09-23
+
+### Changed — BREAKING
+
+- catgraph dependencies (`catgraph`, `catgraph-applied`, `catgraph-dl`,
+  `catgraph-syntax`) pinned at git tag `v0.24.0` (was `v0.23.0`). The term and
+  lineage tiers' `G: PropSignature` bounds require `catgraph::CanonicalEncode`
+  on `G` and `G::Color`.
+
 ## [0.3.0] - 2026-09-22
 
 ### Added

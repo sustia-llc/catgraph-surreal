@@ -36,6 +36,16 @@ enum Gen {
     Add,
 }
 
+/// One variant byte: `Copy` 0, `Add` 1.
+impl catgraph::CanonicalEncode for Gen {
+    fn encode_canonical(&self, out: &mut Vec<u8>) {
+        out.push(match self {
+            Self::Copy => 0,
+            Self::Add => 1,
+        });
+    }
+}
+
 impl PropSignature for Gen {
     type Color = ();
 
@@ -101,6 +111,11 @@ fn two_reducible_sites() -> ColoredExpr<Gen> {
 /// A signature type that is itself neither `Send` nor `Sync`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 struct NotSend(PhantomData<*const ()>);
+
+/// The type has one value, which encodes to no bytes.
+impl catgraph::CanonicalEncode for NotSend {
+    fn encode_canonical(&self, _out: &mut Vec<u8>) {}
+}
 
 impl PropSignature for NotSend {
     type Color = ();
