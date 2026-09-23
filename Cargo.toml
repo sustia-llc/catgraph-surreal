@@ -1,6 +1,6 @@
 [package]
 name = "catgraph-surreal"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 # Measured, not guessed: the cross-feature maximum over the resolved dependency
 # graph (see README "MSRV"). Re-measure whenever a dependency moves.
